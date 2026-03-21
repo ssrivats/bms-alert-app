@@ -84,6 +84,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/status/<monitor_id>")
+def status_page(monitor_id):
+    return render_template("status.html", monitor_id=monitor_id)
+
+
 @app.route("/api/cities")
 def get_cities():
     return jsonify(CITIES)

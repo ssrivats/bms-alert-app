@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Monitor Status — BMS Seat Alert</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet"/>
+  <style>
+    :root { --red: #e94560; }
+    body  { background: #1a1a2e; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+    .card { background: #16213e; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    .badge { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 20px; font-weight: 600; font-size: 13px; }
+    .badge-watching { background: rgba(251,191,36,0.12); color: #fbbf24; }
+    .badge-found    { background: rgba(52,211,153,0.12); color: #34d399; }
+    .badge-stopped  { background: rgba(239,68,68,0.12);  color: #ef4444; }
+    .pulse { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+    .log-line { font-family: 'Fira Code', monospace; font-size: 12px; padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; gap: 10px; }
+    .log-time { color: rgba(255,255,255,0.28); flex-shrink: 0; }
+    .log-msg  { color: rgba(255,255,255,0.7); }
+    .log-msg.success { color: #34d399; font-weight: 600; }
+    .stat-box { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 14px 16px; }
+    .stat-val  { font-size: 22px; font-weight: 800; color: #fff; }
+    .stat-key  { font-size: 11px; color: rgba(255,255,255,0.35); margin-top: 2px; }
+    .back-link { color: var(--red); font-size: 13px; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    #foundBanner { display: none; }
+    .btn-stop { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.25); border-radius: 10px; color: #ef4444; font-size: 13px; font-weight: 600; padding: 10px 20px; cursor: pointer; }
+    .btn-stop:hover { background: rgba(239,68,68,0.2); }
+  </style>
+</head>
+<body>
+<div class="max-w-2xl mx-auto px-4 py-8">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <a href="/" class="back-link">← Back to home</a>
+      <h1 class="text-2xl font-bold mt-1">🎬 Monitor Status</h1>
+    </div>
+    <span id="statusBadge" class="badge badge-watching">
+      <span class="pulse">●</span> <span id="badgeText">Starting...</span>
+    </span>
+  </div>
+
+  <!-- Seats found banner -->
+  <div id="foundBanner" class="p-4 rounded-xl mb-6" style="background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.3);">
+    <p class="font-bold text-lg" style="color:#34d399;">🎉 Seats Available! WhatsApp alert sent.</p>
+    <p class="text-sm mt-1" style="color:rgba(255,255,255,0.5);">Check your WhatsApp for the booking link.</p>
+  </div>
+
+  <!-- Show info card -->
+  <div class="card p-5 mb-4">
+    <div class="flex flex-wrap gap-4 mb-4">
+      <div class="flex-1 min-w-0">
+        <p class="text-xs mb-1" style="color:rgba(255,255,255,0.35);">SHOW</p>
+        <p class="font-bold text-lg truncate" id="infoMovie">—</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <p class="text-xs mb-1" style="color:rgba(255,255,255,0.35);">PREFERRED ROWS</p>
+        <p class="font-semibold" id="infoRows">—</p>
+      </div>
+      <div>
+        <p class="text-xs mb-1" style="color:rgba(255,255,255,0.35);">WHATSAPP</p>
+        <p class="font-semibold" id="infoPhone">—</p>
+      </div>
+      <div>
+        <p class="text-xs mb-1" style="color:rgba(255,255,255,0.35);">STARTED</p>
+        <p class="font-semibold text-sm" id="infoStarted">—</p>
+      </div>
+      <div>
+        <p class="text-xs mb-1" style="color:rgba(255,255,255,0.35);">LAST CHECKED</p>
+        <p class="font-semibold text-sm" id="infoLastChecked">—</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-3 gap-3 mb-4">
+    <div class="stat-box">
+      <div class="stat-val" id="statPolls">0</div>
+      <div class="stat-key">Total checks</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="statInterval">8s</div>
+      <div class="stat-key">Poll interval</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="statUptime">—</div>
+      <div class="stat-key">Running for</div>
+    </div>
+  </div>
+
+  <!-- Live log -->
+  <div class="card p-5 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold">Live log</h2>
+      <span class="text-xs" style="color:rgba(255,255,255,0.3);">Auto-refreshes every 5s</span>
+    </div>
+    <div id="logFeed" style="max-height:320px;overflow-y:auto;">
+      <p class="text-sm" style="color:rgba(255,255,255,0.25);">Waiting for first poll...</p>
+    </div>
+  </div>
+
+  <!-- Stop button -->
+  <div class="text-center" id="stopSection">
+    <button class="btn-stop" id="stopBtn">⏹ Stop monitoring</button>
+  </div>
+
+</div>
+
+<script>
+  const MONITOR_ID = "{{ monitor_id }}";
+  const API_BASE   = window.location.origin;
+  let startedAt    = null;
+  let timer        = null;
+
+  async function fetchStatus() {
+    try {
+      const resp = await fetch(`${API_BASE}/api/monitor/${MONITOR_ID}`);
+      if (!resp.ok) { showError(); return; }
+      const d = await resp.json();
+
+      // Config info
+      document.getElementById('infoMovie').textContent       = d.config?.movie || '—';
+      document.getElementById('infoRows').textContent        = d.config?.preferred_row || 'Any seat';
+      document.getElementById('infoPhone').textContent       = d.config?.phone || '—';
+      document.getElementById('infoLastChecked').textContent = d.last_checked  || '—';
+      document.getElementById('statPolls').textContent       = d.poll_count    || 0;
+      document.getElementById('statInterval').textContent    = `${d.config?.poll_interval || 8}s`;
+
+      if (!startedAt && d.started_at) {
+        startedAt = new Date(d.started_at);
+        document.getElementById('infoStarted').textContent =
+          startedAt.toLocaleTimeString();
+      }
+      if (startedAt) {
+        const secs = Math.floor((Date.now() - startedAt) / 1000);
+        document.getElementById('statUptime').textContent =
+          secs < 60 ? `${secs}s` : secs < 3600 ? `${Math.floor(secs/60)}m` : `${Math.floor(secs/3600)}h`;
+      }
+
+      // Status badge
+      const badge    = document.getElementById('statusBadge');
+      const badgeTxt = document.getElementById('badgeText');
+      if (d.status === 'seats_found' || d.alert_sent) {
+        badge.className = 'badge badge-found';
+        badgeTxt.textContent = 'Seats found!';
+        document.getElementById('foundBanner').style.display = 'block';
+        document.getElementById('stopSection').style.display = 'none';
+        clearInterval(timer);
+      } else if (d.status === 'stopped') {
+        badge.className = 'badge badge-stopped';
+        badgeTxt.textContent = 'Stopped';
+        clearInterval(timer);
+      } else {
+        badge.className = 'badge badge-watching';
+        badgeTxt.innerHTML = '<span class="pulse">●</span> Watching';
+      }
+
+      // Log feed
+      const feed = document.getElementById('logFeed');
+      if (d.logs && d.logs.length > 0) {
+        feed.innerHTML = [...d.logs].reverse().map(l => `
+          <div class="log-line">
+            <span class="log-time">${l.time}</span>
+            <span class="log-msg ${l.message.includes('🎉') || l.message.includes('✅') ? 'success' : ''}">${l.message}</span>
+          </div>`).join('');
+      }
+
+    } catch (e) { showError(); }
+  }
+
+  function showError() {
+    document.getElementById('badgeText').textContent = 'Connection error';
+  }
+
+  // Stop button
+  document.getElementById('stopBtn').addEventListener('click', async () => {
+    if (!confirm('Stop monitoring this show?')) return;
+    try {
+      await fetch(`${API_BASE}/api/monitor/${MONITOR_ID}/stop`, { method: 'POST' });
+      clearInterval(timer);
+      fetchStatus();
+    } catch (_) {}
+  });
+
+  // Start polling
+  fetchStatus();
+  timer = setInterval(fetchStatus, 5000);
+</script>
+</body>
+</html>
