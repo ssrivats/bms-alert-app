@@ -1122,6 +1122,39 @@ def _send_alert(monitor_id, booking_url):
     _add_log(monitor_id, "❌ All 3 WhatsApp send attempts failed", "error")
 
 
+def _resume_monitors():
+    """
+    On startup, re-spawn threads for any monitors that were still active when
+    the server last stopped (e.g. after a Railway redeploy).  Without this,
+    Redis correctly persists the monitor records but nothing is actually polling.
+    """
+    if not _redis:
+        return  # in-memory store is always empty on startup — nothing to resume
+
+    resumed = 0
+    for monitor in _load_all_monitors().values():
+        status = monitor.get("status", "")
+        if status not in ("monitoring", "waiting_for_session"):
+            continue
+
+        monitor_id = monitor["id"]
+        # Reset failure count so we get a clean slate on the new thread
+        monitor["failures"] = 0
+        _save_monitor(monitor_id, monitor)
+        _add_log(monitor_id, "🔄 Resuming after server restart", "info")
+
+        thread = threading.Thread(target=_run_monitor, args=(monitor_id,), daemon=True)
+        thread.start()
+        resumed += 1
+
+    if resumed:
+        log.info("▶ Resumed %d active monitor(s) from Redis", resumed)
+
+
+# Resume any active monitors that survived in Redis across this restart
+_resume_monitors()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
