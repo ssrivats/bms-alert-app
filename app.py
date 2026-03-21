@@ -275,6 +275,28 @@ def stop_monitor(monitor_id):
     return jsonify({"status": "stopped"})
 
 
+@app.route("/api/monitor/<monitor_id>/test-trigger", methods=["POST"])
+def test_trigger(monitor_id):
+    """Force-fire the seat-found alert for a monitor — useful for end-to-end testing."""
+    monitor = _load_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Not found"}), 404
+
+    # Stamp a fake result so the WhatsApp message looks realistic
+    monitor["last_result"] = "Test trigger — forced alert"
+    monitor["status"]      = "seats_found"
+    _save_monitor(monitor_id, monitor)
+    _add_log(monitor_id, "🧪 Test trigger fired — sending alert", "info")
+
+    booking_url = monitor["config"].get("booking_url") or monitor["config"].get("listing_url", "")
+    # Reset alert_sent so _send_alert doesn't short-circuit
+    monitor["alert_sent"] = False
+    _save_monitor(monitor_id, monitor)
+
+    _send_alert(monitor_id, booking_url)
+    return jsonify({"status": "triggered", "monitor_id": monitor_id})
+
+
 @app.route("/api/test-whatsapp", methods=["POST"])
 def test_whatsapp():
     data = request.json or {}
@@ -382,13 +404,27 @@ def _run_monitor(monitor_id):
                             config.get("listing_url") if mode == "listing"
                             else config.get("booking_url")
                         )
-                        page.goto(nav_url, timeout=30_000, wait_until="domcontentloaded")
+                        wait_event = "domcontentloaded" if mode == "listing" else "networkidle"
+                        page.goto(nav_url, timeout=45_000, wait_until=wait_event)
                         first_load       = False
                         needs_navigation = False
                     else:
-                        page.reload(timeout=30_000, wait_until="domcontentloaded")
+                        wait_event = "domcontentloaded" if mode == "listing" else "networkidle"
+                        page.reload(timeout=45_000, wait_until=wait_event)
 
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(2000)
+
+                    # For session mode wait until __INITIAL_STATE__ is hydrated
+                    # (BMS populates it via client-side JS after domcontentloaded)
+                    if mode == "session":
+                        try:
+                            page.wait_for_function(
+                                "() => !!window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData",
+                                timeout=20_000,
+                            )
+                        except Exception:
+                            # Timeout or error — let _check_availability report details
+                            pass
 
                     # ── Check availability (mode-specific) ───────────────────
                     if mode == "listing":
@@ -794,8 +830,13 @@ def _check_availability(page, session_id, preferred_categories, preferred_rows, 
             }
 
             try {
-                const seatLayout = window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData;
-                if (!seatLayout) return { error: "no_initial_state" };
+                const initState = window.__INITIAL_STATE__;
+                if (!initState) return { error: "no_initial_state:__INITIAL_STATE__missing" };
+                const seatLayout = initState?.seatlayoutMovies?.seatLayoutData;
+                if (!seatLayout) {
+                    const keys = Object.keys(initState).join(",");
+                    return { error: "no_initial_state:keys=" + keys.slice(0, 200) };
+                }
 
                 const venue = seatLayout.currentVenue;
                 if (!venue) return { error: "no_venue" };
