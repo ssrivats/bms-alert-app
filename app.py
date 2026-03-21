@@ -275,28 +275,6 @@ def stop_monitor(monitor_id):
     return jsonify({"status": "stopped"})
 
 
-@app.route("/api/monitor/<monitor_id>/test-trigger", methods=["POST"])
-def test_trigger(monitor_id):
-    """Force-fire the seat-found alert for a monitor — useful for end-to-end testing."""
-    monitor = _load_monitor(monitor_id)
-    if not monitor:
-        return jsonify({"error": "Not found"}), 404
-
-    # Stamp a fake result so the WhatsApp message looks realistic
-    monitor["last_result"] = "Test trigger — forced alert"
-    monitor["status"]      = "seats_found"
-    _save_monitor(monitor_id, monitor)
-    _add_log(monitor_id, "🧪 Test trigger fired — sending alert", "info")
-
-    booking_url = monitor["config"].get("booking_url") or monitor["config"].get("listing_url", "")
-    # Reset alert_sent so _send_alert doesn't short-circuit
-    monitor["alert_sent"] = False
-    _save_monitor(monitor_id, monitor)
-
-    _send_alert(monitor_id, booking_url)
-    return jsonify({"status": "triggered", "monitor_id": monitor_id})
-
-
 @app.route("/api/test-whatsapp", methods=["POST"])
 def test_whatsapp():
     data = request.json or {}
