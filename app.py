@@ -84,6 +84,19 @@ def start_monitor():
     return jsonify({"monitor_id": monitor_id, "status": "started"})
 
 
+@app.route("/api/monitor/<monitor_id>")
+def get_monitor(monitor_id):
+    """Get current status of a monitor."""
+    monitor = monitors.get(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({
+        "id": monitor["id"],
+        "status": monitor["status"],
+        "logs": monitor["logs"][-10:],
+    })
+
+
 @app.route("/api/monitor/<monitor_id>/stop", methods=["POST"])
 def stop_monitor(monitor_id):
     """Stop a monitor."""
