@@ -386,7 +386,7 @@ def _run_monitor(monitor_id):
                 else:
                     page.reload(timeout=30_000, wait_until="domcontentloaded")
 
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(3500)  # BMS seat map needs time to render
 
                 available, reason = _check_rows(page, config["preferred_row"])
 
@@ -399,7 +399,7 @@ def _run_monitor(monitor_id):
                 if available:
                     _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
                     monitor = _load_monitor(monitor_id)
-                    monitor["status"] = "found"
+                    monitor["status"] = "seats_found"
                     _save_monitor(monitor_id, monitor)
                     _send_alert(monitor_id, booking_url)
                     break
@@ -471,104 +471,132 @@ def _smart_interval(showtime_str: str, default: int = 20) -> int:
 
 def _check_rows(page, preferred_rows: str) -> tuple:
     """
-    Check if preferred rows have available seats.
-    Uses Playwright JS DOM scan; falls back to text scan if that fails.
-    """
-    page_text = page.inner_text("body").lower()
+    Robust seat detection for BookMyShow.
 
+    Strategy:
+    1. Detect if show is sold out
+    2. Try row-based detection (best case)
+    3. If row detection fails → fallback to seat presence
+    4. Always prefer "alert > miss"
+    """
+
+    try:
+        page_text = page.inner_text("body").lower()
+    except Exception:
+        return False, "Page not ready"
+
+    # ─────────────────────────────────────────────
+    # 1. SOLD OUT CHECK (fast exit)
+    # ─────────────────────────────────────────────
     if any(p in page_text for p in ["sold out", "housefull", "no seats available"]):
         return False, "Show is sold out"
 
+    # Normalize preferred rows
     rows_list = [r.strip().upper() for r in preferred_rows.split(",") if r.strip()]
 
-    if not rows_list:
-        seats = page.query_selector_all("[class*='seat'], [class*='Seat']")
-        if seats:
-            return True, f"Seat map open ({len(seats)} seats visible)"
-        return False, "No seat map visible yet"
+    # ─────────────────────────────────────────────
+    # 2. COLLECT ALL SEATS (base signal)
+    # ─────────────────────────────────────────────
+    try:
+        seats = page.query_selector_all(
+            '[class*="seat"], [class*="Seat"], [class*="__seat"], [class*="_seat"]'
+        )
+    except Exception:
+        seats = []
 
-    # ── Primary: DOM-based scan ────────────────────────────────────────────────
+    seat_count = len(seats)
+    log.info("[seat-scan] Total seats found: %d", seat_count)
+
+    # If no seats → seat map not loaded yet
+    if seat_count < 10:
+        return False, "Seat map not loaded yet"
+
+    # ─────────────────────────────────────────────
+    # 3. IF NO ROW PREFERENCE → SUCCESS
+    # ─────────────────────────────────────────────
+    if not rows_list:
+        return True, f"Seat map open ({seat_count} seats detected)"
+
+    # ─────────────────────────────────────────────
+    # 4. TRY ROW-LEVEL DETECTION (best effort)
+    # ─────────────────────────────────────────────
     try:
         result = page.evaluate("""
         (targetRows) => {
-            const found   = [];
-            const scanned = [];
+            const rowsFound = {};
+            const debug = [];
 
-            const ROW_SELECTORS = [
-                '[class*="seat-row"]', '[class*="SeatRow"]',
-                '[class*="seatRow"]',  '[class*="row-container"]',
-                '[class*="RowContainer"]',
-            ];
+            const seatEls = Array.from(document.querySelectorAll(
+                '[class*="seat"], [class*="Seat"], [class*="__seat"], [class*="_seat"]'
+            )).filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 4 && r.width < 80 && r.height > 4 && r.height < 80;
+            });
 
-            let rowEls = [];
-            let usedSel = '';
-            for (const sel of ROW_SELECTORS) {
-                const els = Array.from(document.querySelectorAll(sel));
-                if (els.length > 2) { rowEls = els; usedSel = sel; break; }
+            debug.push(`seats:${seatEls.length}`);
+
+            for (const seat of seatEls) {
+                const cls = (seat.className || '').toLowerCase();
+                const isAvailable = !cls.includes('unavailable') && !cls.includes('blocked');
+
+                if (!isAvailable) continue;
+
+                let node = seat;
+                let rowLabel = null;
+
+                // Walk up DOM to find row label
+                for (let i = 0; i < 5 && node; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+
+                    const text = (node.innerText || '').trim();
+
+                    // Match A, B, AA, etc
+                    const match = text.match(/\\b[A-Z]{1,2}\\b/);
+                    if (match) {
+                        rowLabel = match[0];
+                        break;
+                    }
+                }
+
+                if (rowLabel) {
+                    rowsFound[rowLabel] = (rowsFound[rowLabel] || 0) + 1;
+                }
             }
 
-            // Fallback: elements whose first child is a single letter
-            if (rowEls.length === 0) {
-                rowEls = Array.from(document.querySelectorAll('*')).filter(el => {
-                    if (el.children.length < 2) return false;
-                    const label = el.firstElementChild?.textContent?.trim();
-                    return label && /^[A-Z]{1,2}$/.test(label);
-                });
-                usedSel = 'fallback-letter-scan';
-            }
-
-            scanned.push(`selector="${usedSel}" rows=${rowEls.length}`);
-
-            for (const rowEl of rowEls) {
-                const labelEl = rowEl.querySelector(
-                    '[class*="label"], [class*="Label"], [class*="row-name"], [class*="rowName"]'
-                );
-                const rawLabel = (labelEl || rowEl.firstElementChild || rowEl)
-                    .textContent.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-                const label = rawLabel.slice(0, 2);
-
-                if (!targetRows.includes(label)) continue;
-
-                const seats = rowEl.querySelectorAll('[class*="seat"], [class*="Seat"]');
-                const available = Array.from(seats).filter(s => {
-                    const cls = (s.className || '').toLowerCase();
-                    const aria = (s.getAttribute('aria-label') || '').toLowerCase();
-                    return !cls.includes('sold')    && !cls.includes('booked') &&
-                           !cls.includes('unavail') && !cls.includes('disabled') &&
-                           !cls.includes('blocked') && !aria.includes('sold') &&
-                           !s.hasAttribute('disabled');
-                }).length;
-
-                scanned.push(`row=${label} total=${seats.length} avail=${available}`);
-                if (available > 0) found.push({ row: label, count: available });
-            }
-
-            return { found, scanned };
+            return { rowsFound, debug };
         }
         """, rows_list)
 
-        for line in result.get("scanned", []):
-            log.info("[seat-scan] %s", line)
+        rows_found = result.get("rowsFound", {})
+        debug_info = result.get("debug", [])
+        for d in debug_info:
+            log.info("[seat-scan] %s", d)
+        log.info("[seat-scan] Rows detected: %s", rows_found)
 
-        found = result.get("found", [])
-        if found:
-            summary = ", ".join(f"Row {f['row']} ({f['count']} seats)" for f in found)
-            return True, f"Available — {summary}"
+        # Match preferred rows
+        for row in rows_list:
+            if row in rows_found and rows_found[row] > 0:
+                return True, f"Row {row} available ({rows_found[row]} seats)"
 
-        scanned_summary = " | ".join(result.get("scanned", [])[:3])
-        return False, f"No seats in rows {preferred_rows} [{scanned_summary}]"
+        # Row detection ran but didn't match preferred rows
+        if rows_found:
+            return False, f"No seats in preferred rows {preferred_rows}. Rows found: {list(rows_found.keys())}"
 
     except Exception as e:
-        log.warning("DOM scan failed: %s — using text fallback", e)
+        log.warning("[seat-scan] Row detection failed: %s — using fallback", e)
 
-    # FIX #10 — text scan fallback
-    for row in rows_list:
-        if (f" {row.lower()} " in page_text or
-                f"row {row.lower()}" in page_text or
-                f"\n{row.lower()}\n" in page_text):
-            return True, f"Row {row} detected (text fallback)"
+    # ─────────────────────────────────────────────
+    # 5. CRITICAL FALLBACK (most important)
+    # ─────────────────────────────────────────────
+    # If seats exist → ALERT (better false positive than miss)
+    if seat_count > 20:
+        return True, f"Seats detected (fallback) — {seat_count} seats visible"
 
-    return False, f"Rows {preferred_rows} not yet available (text scan)"
+    # ─────────────────────────────────────────────
+    # 6. FINAL FAILURE
+    # ─────────────────────────────────────────────
+    return False, f"No available seats detected (checked {seat_count} seats)"
 
 
 def _send_alert(monitor_id, booking_url):
