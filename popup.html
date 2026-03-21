@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+    }
+    .header {
+      background: #e94560;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header img { width: 24px; height: 24px; }
+    .header-text h1 { font-size: 15px; font-weight: 700; color: #fff; }
+    .header-text p  { font-size: 11px; color: rgba(255,255,255,0.75); margin-top: 1px; }
+    .body { padding: 16px; }
+
+    /* ── Views ── */
+    .view { display: none; }
+    .view.active { display: block; }
+
+    /* Not on BMS */
+    #notBmsView { text-align: center; padding: 24px 8px; }
+    #notBmsView .big-icon { font-size: 36px; margin-bottom: 10px; }
+    #notBmsView p { font-size: 13px; color: rgba(255,255,255,0.5); line-height: 1.6; }
+    .link-btn { color: #e94560; text-decoration: none; font-size: 13px; display: inline-block; margin-top: 10px; }
+
+    /* Main setup */
+    .show-chip {
+      background: rgba(233,69,96,0.1);
+      border: 1px solid rgba(233,69,96,0.25);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+    }
+    .chip-label { font-size: 10px; color: rgba(255,255,255,0.35); text-transform: uppercase; letter-spacing: 0.5px; }
+    .chip-name  { font-size: 13px; font-weight: 600; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    label { font-size: 12px; color: rgba(255,255,255,0.45); display: block; margin-bottom: 5px; }
+
+    input[type="text"], input[type="tel"] {
+      width: 100%;
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 9px;
+      padding: 10px 12px;
+      color: #fff;
+      font-size: 13px;
+      outline: none;
+      transition: border 0.2s;
+    }
+    input:focus { border-color: #e94560; background: rgba(255,255,255,0.1); }
+    input::placeholder { color: rgba(255,255,255,0.25); }
+
+    .input-group { margin-bottom: 12px; }
+
+    .row-grid { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 4px; }
+    .row-btn {
+      width: 34px; height: 34px;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 7px;
+      background: rgba(255,255,255,0.04);
+      color: #bbb;
+      font-size: 12px; font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .row-btn:hover  { border-color: #e94560; color: #fff; }
+    .row-btn.selected { background: #e94560; border-color: #e94560; color: #fff; }
+    .row-hint { font-size: 11px; color: rgba(255,255,255,0.28); margin-bottom: 12px; margin-top: 4px; }
+
+    .divider { height: 1px; background: rgba(255,255,255,0.07); margin: 12px 0; }
+
+    /* Phone prefix */
+    .phone-wrap { display: flex; gap: 6px; }
+    .prefix {
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-size: 13px;
+      color: rgba(255,255,255,0.5);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    /* Buttons */
+    .btn-primary {
+      width: 100%; padding: 11px;
+      background: #e94560; border: none; border-radius: 10px;
+      color: #fff; font-size: 14px; font-weight: 700;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .btn-primary:hover    { background: #c73e54; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-danger {
+      width: 100%; padding: 10px;
+      background: rgba(239,68,68,0.1);
+      border: 1px solid rgba(239,68,68,0.25);
+      border-radius: 10px;
+      color: #ef4444; font-size: 13px; font-weight: 600;
+      cursor: pointer; margin-top: 8px;
+    }
+    .btn-danger:hover { background: rgba(239,68,68,0.18); }
+
+    /* Submitting spinner */
+    .spinner-wrap { text-align: center; padding: 20px 0; }
+    .spinner {
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top: 3px solid #e94560;
+      border-radius: 50%;
+      width: 32px; height: 32px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 10px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Monitoring view */
+    .status-pill {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(251,191,36,0.1);
+      border-radius: 8px; padding: 9px 12px;
+      font-size: 12px; font-weight: 600; color: #fbbf24;
+      margin-bottom: 12px;
+    }
+    .pulse { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+
+    .info-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 5px; }
+    .info-row .k { color: rgba(255,255,255,0.35); }
+    .info-row .v { color: #e0e0e0; font-weight: 500; }
+
+    /* Success view */
+    #successView { text-align: center; padding: 20px 0; }
+    .success-icon { font-size: 42px; margin-bottom: 10px; }
+    .success-title { font-size: 16px; font-weight: 700; color: #34d399; margin-bottom: 6px; }
+    .success-sub   { font-size: 12px; color: rgba(255,255,255,0.4); line-height: 1.6; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <img src="icons/icon48.png" alt="" />
+    <div class="header-text">
+      <h1>BMS Seat Alert</h1>
+      <p>Powered by cloud • WhatsApp alerts</p>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- ① Not on BMS page -->
+    <div class="view" id="notBmsView">
+      <div class="big-icon">🎬</div>
+      <p>Open a <strong>BookMyShow</strong> show page first, then click this icon.</p>
+      <a class="link-btn" href="https://in.bookmyshow.com" target="_blank">Open BookMyShow →</a>
+    </div>
+
+    <!-- ② Main setup -->
+    <div class="view" id="setupView">
+      <div class="show-chip">
+        <div class="chip-label">Show detected</div>
+        <div class="chip-name" id="showNameLabel">Loading...</div>
+      </div>
+
+      <label>Preferred row(s)</label>
+      <div class="row-grid" id="rowGrid"></div>
+      <p class="row-hint" id="rowHint">No row selected — alerts for any seat</p>
+
+      <div class="divider"></div>
+
+      <div class="input-group">
+        <label>WhatsApp number</label>
+        <div class="phone-wrap">
+          <span class="prefix">+91</span>
+          <input type="tel" id="phoneInput" placeholder="98765 43210" maxlength="10" />
+        </div>
+      </div>
+
+      <button class="btn-primary" id="notifyBtn" disabled>🔔 Notify Me via WhatsApp</button>
+    </div>
+
+    <!-- ③ Submitting -->
+    <div class="view" id="submittingView">
+      <div class="spinner-wrap">
+        <div class="spinner"></div>
+        <p style="font-size:13px;color:rgba(255,255,255,0.5);">Sending to server...</p>
+      </div>
+    </div>
+
+    <!-- ④ Active monitoring -->
+    <div class="view" id="monitorView">
+      <div class="status-pill">
+        <span class="pulse">●</span>
+        <span id="statusText">Server is watching 24/7</span>
+      </div>
+
+      <div class="show-chip">
+        <div class="chip-label">Monitoring</div>
+        <div class="chip-name" id="monShowName"></div>
+      </div>
+
+      <div class="info-row"><span class="k">Rows</span><span class="v" id="monRows">—</span></div>
+      <div class="info-row"><span class="k">WhatsApp</span><span class="v" id="monPhone">—</span></div>
+
+      <div class="divider"></div>
+
+      <div class="info-row">
+        <span class="k">Checks done</span>
+        <span class="v" id="monPolls">—</span>
+      </div>
+      <div class="info-row">
+        <span class="k">Last checked</span>
+        <span class="v" id="monLastChecked">—</span>
+      </div>
+      <div class="info-row">
+        <span class="k">Last result</span>
+        <span class="v" id="monLastResult">—</span>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-top:12px;align-items:center;justify-content:space-between;">
+        <p style="font-size:10px;color:rgba(255,255,255,0.2);">Close Chrome safely — server keeps watching</p>
+        <div style="display:flex;gap:10px;flex-shrink:0;">
+          <a id="logLink" href="#" target="_blank"
+             style="font-size:11px;color:rgba(255,255,255,0.3);text-decoration:none;white-space:nowrap;">
+            This job ↗
+          </a>
+          <a id="dashboardLink" href="#" target="_blank"
+             style="font-size:11px;color:#e94560;text-decoration:none;white-space:nowrap;">
+            All monitors ↗
+          </a>
+        </div>
+      </div>
+
+      <button class="btn-danger" id="cancelBtn">Cancel monitoring</button>
+    </div>
+
+    <!-- ⑤ Success -->
+    <div class="view" id="successView">
+      <div class="success-icon">🎉</div>
+      <div class="success-title">Seats Available!</div>
+      <p class="success-sub" id="successMsg">Check your WhatsApp — we sent you the booking link.</p>
+      <button class="btn-primary" id="watchAnotherBtn">Watch another show</button>
+    </div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
