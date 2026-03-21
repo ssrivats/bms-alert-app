@@ -108,31 +108,9 @@ def _add_log(monitor_id, message, event_type="info"):
     log.info("[%s] %s", monitor_id, message)
 
 
-_browser_lock = threading.Lock()
-_shared_playwright = None
-_shared_browser = None
-
-
-def _get_browser():
-    global _shared_playwright, _shared_browser
-    with _browser_lock:
-        if _shared_browser and _shared_browser.is_connected():
-            return _shared_browser
-
-        from playwright.sync_api import sync_playwright
-
-        if _shared_playwright:
-            try:
-                _shared_playwright.stop()
-            except Exception:
-                pass
-
-        _shared_playwright = sync_playwright().start()
-        _shared_browser = _shared_playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        return _shared_browser
+# sync_playwright uses greenlets and is NOT thread-safe across OS threads.
+# Each monitor thread creates and manages its own Playwright instance instead
+# of sharing one — see _run_monitor for usage.
 
 
 @app.route("/health")
@@ -325,7 +303,9 @@ def test_whatsapp():
 
 
 def _run_monitor(monitor_id):
-    from playwright.sync_api import TimeoutError as PwTimeout
+    # sync_playwright uses greenlets and is NOT safe to share across OS threads.
+    # Each monitor thread creates and owns its own Playwright + browser instance.
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
     monitor = _load_monitor(monitor_id)
     config  = monitor["config"]
@@ -353,140 +333,146 @@ def _run_monitor(monitor_id):
     needs_navigation = False   # set True when transitioning listing → session
 
     try:
-        browser = _get_browser()
-        context = browser.new_context(
-            user_agent=BMS_UA,
-            viewport={"width": 1280, "height": 900},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = context.new_page()
-        payload_cache = {"snapshot": None, "source": "", "updated_at": None}
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            window.chrome = { runtime: {} };
-        """)
-        page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda route: route.abort())
-        page.on("response", lambda response: _capture_layout_response(response, payload_cache))
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                user_agent=BMS_UA,
+                viewport={"width": 1280, "height": 900},
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+            )
+            page = context.new_page()
+            payload_cache = {"snapshot": None, "source": "", "updated_at": None}
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = { runtime: {} };
+            """)
+            page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda route: route.abort())
+            page.on("response", lambda response: _capture_layout_response(response, payload_cache))
 
-        while True:
-            monitor = _load_monitor(monitor_id)
-            if not monitor or monitor["status"] not in ("monitoring", "waiting_for_session"):
-                break
-
-            if time.time() - start_time > MAX_RUNTIME_SECS:
-                monitor["status"] = "timeout"
-                _save_monitor(monitor_id, monitor)
-                _add_log(monitor_id, "⏰ Monitor timed out after 30 minutes", "timeout")
-                break
-
-            # Always read fresh config (it may have been mutated during a mode transition)
-            config        = monitor["config"]
-            mode          = config.get("mode", "session")
-            showtime_hint = config.get("showtime") or config.get("target_showtime", "")
-            poll_interval = _smart_interval(showtime_hint, config["poll_interval"])
-
-            monitor["poll_count"] = monitor.get("poll_count", 0) + 1
-            _save_monitor(monitor_id, monitor)
-            _add_log(monitor_id, f"Poll #{monitor['poll_count']} (every {poll_interval}s)…", "poll")
-
-            try:
-                # ── Navigate or reload ────────────────────────────────────────
-                if first_load or needs_navigation:
-                    nav_url = config.get("listing_url") if mode == "listing" else config.get("booking_url")
-                    page.goto(nav_url, timeout=30_000, wait_until="domcontentloaded")
-                    first_load       = False
-                    needs_navigation = False
-                else:
-                    page.reload(timeout=30_000, wait_until="domcontentloaded")
-
-                page.wait_for_timeout(3000)
-
-                # ── Check availability (mode-specific) ───────────────────────
-                if mode == "listing":
-                    available, reason, session_id = _check_listing_availability(
-                        page, config, monitor_id
-                    )
-                else:
-                    available, reason = _check_availability(
-                        page,
-                        config.get("session_id", ""),
-                        config.get("preferred_categories", []),
-                        config.get("preferred_rows", []),
-                        payload_cache,
-                        monitor_id=monitor_id,
-                    )
-                    session_id = None
-
+            while True:
                 monitor = _load_monitor(monitor_id)
-                monitor["last_checked"] = datetime.now().strftime("%H:%M:%S")
-                monitor["last_result"]  = reason
-                monitor["failures"]     = 0
+                if not monitor or monitor["status"] not in ("monitoring", "waiting_for_session"):
+                    break
+
+                if time.time() - start_time > MAX_RUNTIME_SECS:
+                    monitor["status"] = "timeout"
+                    _save_monitor(monitor_id, monitor)
+                    _add_log(monitor_id, "⏰ Monitor timed out after 30 minutes", "timeout")
+                    break
+
+                # Always read fresh config (may have changed during a mode transition)
+                config        = monitor["config"]
+                mode          = config.get("mode", "session")
+                showtime_hint = config.get("showtime") or config.get("target_showtime", "")
+                poll_interval = _smart_interval(showtime_hint, config["poll_interval"])
+
+                monitor["poll_count"] = monitor.get("poll_count", 0) + 1
                 _save_monitor(monitor_id, monitor)
+                _add_log(monitor_id, f"Poll #{monitor['poll_count']} (every {poll_interval}s)…", "poll")
 
-                # ── Handle result ─────────────────────────────────────────────
-                if available:
+                try:
+                    # ── Navigate or reload ────────────────────────────────────
+                    if first_load or needs_navigation:
+                        nav_url = (
+                            config.get("listing_url") if mode == "listing"
+                            else config.get("booking_url")
+                        )
+                        page.goto(nav_url, timeout=30_000, wait_until="domcontentloaded")
+                        first_load       = False
+                        needs_navigation = False
+                    else:
+                        page.reload(timeout=30_000, wait_until="domcontentloaded")
+
+                    page.wait_for_timeout(3000)
+
+                    # ── Check availability (mode-specific) ───────────────────
                     if mode == "listing":
-                        seat_url       = _build_seat_layout_url(config, session_id)
-                        preferred_rows = config.get("preferred_rows", [])
+                        available, reason, session_id = _check_listing_availability(
+                            page, config, monitor_id
+                        )
+                    else:
+                        available, reason = _check_availability(
+                            page,
+                            config.get("session_id", ""),
+                            config.get("preferred_categories", []),
+                            config.get("preferred_rows", []),
+                            payload_cache,
+                            monitor_id=monitor_id,
+                        )
+                        session_id = None
 
-                        if not preferred_rows:
-                            # No row filter → alert immediately with the seat-layout URL
+                    monitor = _load_monitor(monitor_id)
+                    monitor["last_checked"] = datetime.now().strftime("%H:%M:%S")
+                    monitor["last_result"]  = reason
+                    monitor["failures"]     = 0
+                    _save_monitor(monitor_id, monitor)
+
+                    # ── Handle result ─────────────────────────────────────────
+                    if available:
+                        if mode == "listing":
+                            seat_url       = _build_seat_layout_url(config, session_id)
+                            preferred_rows = config.get("preferred_rows", [])
+
+                            if not preferred_rows:
+                                # No row filter → alert immediately
+                                monitor = _load_monitor(monitor_id)
+                                monitor["status"] = "seats_found"
+                                _save_monitor(monitor_id, monitor)
+                                _add_log(monitor_id, f"✅ Show is open: {reason}", "found")
+                                _send_alert(monitor_id, seat_url)
+                                break
+
+                            else:
+                                # Row filter → transition to session mode
+                                _add_log(
+                                    monitor_id,
+                                    f"🔄 Show opened — switching to row-level monitoring ({reason})",
+                                    "info",
+                                )
+                                monitor = _load_monitor(monitor_id)
+                                monitor["config"]["mode"]        = "session"
+                                monitor["config"]["session_id"]  = session_id
+                                monitor["config"]["booking_url"] = seat_url
+                                monitor["status"] = "monitoring"
+                                _save_monitor(monitor_id, monitor)
+                                payload_cache    = {"snapshot": None, "source": "", "updated_at": None}
+                                needs_navigation = True
+                                continue  # navigate immediately, skip sleep
+
+                        else:
                             monitor = _load_monitor(monitor_id)
                             monitor["status"] = "seats_found"
                             _save_monitor(monitor_id, monitor)
-                            _add_log(monitor_id, f"✅ Show is open: {reason}", "found")
-                            _send_alert(monitor_id, seat_url)
+                            _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
+                            _send_alert(monitor_id, config["booking_url"])
                             break
 
-                        else:
-                            # Has row filter → transition to session mode for row-level check
-                            _add_log(
-                                monitor_id,
-                                f"🔄 Show opened — switching to row-level monitoring ({reason})",
-                                "info",
-                            )
-                            monitor = _load_monitor(monitor_id)
-                            monitor["config"]["mode"]        = "session"
-                            monitor["config"]["session_id"]  = session_id
-                            monitor["config"]["booking_url"] = seat_url
-                            monitor["status"] = "monitoring"
-                            _save_monitor(monitor_id, monitor)
+                    _add_log(monitor_id, f"⏳ {reason}", "poll")
 
-                            # Reset payload cache for the new seat-layout page
-                            payload_cache    = {"snapshot": None, "source": "", "updated_at": None}
-                            needs_navigation = True
-                            # Skip the sleep — navigate immediately
-                            continue
-
-                    else:
-                        monitor = _load_monitor(monitor_id)
-                        monitor["status"] = "seats_found"
+                except PwTimeout:
+                    _handle_failure(monitor_id, "Page load timed out")
+                except Exception as exc:
+                    _handle_failure(monitor_id, f"Error: {str(exc)[:100]}")
+                    monitor = _load_monitor(monitor_id)
+                    if monitor and monitor.get("failures", 0) >= MAX_FAILURES:
+                        monitor["status"] = "error"
                         _save_monitor(monitor_id, monitor)
-                        _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
-                        _send_alert(monitor_id, config["booking_url"])
+                        _add_log(monitor_id, "❌ Too many failures, stopping", "error")
                         break
 
-                _add_log(monitor_id, f"⏳ {reason}", "poll")
+                time.sleep(poll_interval + random.uniform(1, 3))
 
-            except PwTimeout:
-                _handle_failure(monitor_id, "Page load timed out")
-            except Exception as exc:
-                _handle_failure(monitor_id, f"Error: {str(exc)[:100]}")
-                monitor = _load_monitor(monitor_id)
-                if monitor and monitor.get("failures", 0) >= MAX_FAILURES:
-                    monitor["status"] = "error"
-                    _save_monitor(monitor_id, monitor)
-                    _add_log(monitor_id, "❌ Too many failures, stopping", "error")
-                    break
+            try:
+                context.close()
+            except Exception:
+                pass
+            # browser and playwright are cleaned up by the `with` block
 
-            time.sleep(poll_interval + random.uniform(1, 3))
-
-        try:
-            context.close()
-        except Exception:
-            pass
     except Exception as exc:
         monitor = _load_monitor(monitor_id)
         if monitor:
