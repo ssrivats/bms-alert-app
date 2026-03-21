@@ -157,14 +157,12 @@ def start_monitor():
     active_for_phone = sum(
         1 for monitor in _load_all_monitors().values()
         if monitor.get("config", {}).get("phone") == phone
-        and monitor.get("status") == "monitoring"
+        and monitor.get("status") in ("monitoring", "waiting_for_session")
     )
     if active_for_phone >= MAX_ACTIVE_PER_PHONE:
         return jsonify({"error": f"You already have {active_for_phone} active monitors. Stop one first."}), 429
 
-    booking_url = data.get("booking_url", "")
-    url_match = re.search(r"/seat-layout/[^/]+/[^/]+/([^/]+)/", booking_url)
-    session_id = url_match.group(1) if url_match else str(data.get("show_id", "")).strip()
+    mode = data.get("mode", "session")
     preferred_categories = [
         str(code).strip().upper()
         for code in data.get("preferred_categories", []) or []
@@ -177,30 +175,69 @@ def start_monitor():
     })
 
     monitor_id = str(uuid.uuid4())[:8]
-    config = {
-        "movie": data.get("movie", ""),
-        "theatre": data.get("theatre", ""),
-        "showtime": data.get("showtime", ""),
-        "booking_url": booking_url,
-        "phone": phone,
-        "poll_interval": _smart_interval(data.get("showtime", ""), int(data.get("poll_interval", 20))),
-        "session_id": session_id,
-        "preferred_categories": preferred_categories,
-        "preferred_rows": preferred_rows,
-    }
+
+    if mode == "listing":
+        # ── Sold-out show monitoring: poll cinema-specific page for session open ──
+        listing_url     = data.get("listing_url", "").strip()
+        event_code      = data.get("event_code", "").strip()
+        venue_code      = data.get("venue_code", "").strip()
+        date            = data.get("date", "").strip()
+        target_showtime = data.get("target_showtime", "").strip()
+
+        if not listing_url or not venue_code:
+            return jsonify({"error": "listing_url and venue_code are required for listing mode"}), 400
+
+        config = {
+            "mode":             "listing",
+            "movie":            data.get("movie", ""),
+            "theatre":          data.get("theatre", ""),
+            "showtime":         target_showtime,   # for _smart_interval + display
+            "listing_url":      listing_url,
+            "event_code":       event_code,
+            "venue_code":       venue_code,
+            "date":             date,
+            "target_showtime":  target_showtime,
+            "booking_url":      "",                # filled in once session is found
+            "phone":            phone,
+            "poll_interval":    _smart_interval(target_showtime, int(data.get("poll_interval", 20))),
+            "session_id":       "",
+            "preferred_categories": preferred_categories,
+            "preferred_rows":   preferred_rows,
+        }
+        initial_status = "waiting_for_session"
+
+    else:
+        # ── Normal seat-layout session monitoring ──────────────────────────────
+        booking_url = data.get("booking_url", "")
+        url_match   = re.search(r"/seat-layout/[^/]+/[^/]+/([^/]+)/", booking_url)
+        session_id  = url_match.group(1) if url_match else str(data.get("show_id", "")).strip()
+
+        config = {
+            "mode":             "session",
+            "movie":            data.get("movie", ""),
+            "theatre":          data.get("theatre", ""),
+            "showtime":         data.get("showtime", ""),
+            "booking_url":      booking_url,
+            "phone":            phone,
+            "poll_interval":    _smart_interval(data.get("showtime", ""), int(data.get("poll_interval", 20))),
+            "session_id":       session_id,
+            "preferred_categories": preferred_categories,
+            "preferred_rows":   preferred_rows,
+        }
+        initial_status = "starting"
 
     monitor = {
-        "id": monitor_id,
-        "config": config,
-        "status": "starting",
-        "started_at": datetime.now().isoformat(),
-        "poll_count": 0,
+        "id":           monitor_id,
+        "config":       config,
+        "status":       initial_status,
+        "started_at":   datetime.now().isoformat(),
+        "poll_count":   0,
         "last_checked": None,
-        "last_result": None,
-        "last_error": None,
-        "alert_sent": False,
-        "failures": 0,
-        "logs": [],
+        "last_result":  None,
+        "last_error":   None,
+        "alert_sent":   False,
+        "failures":     0,
+        "logs":         [],
     }
     _save_monitor(monitor_id, monitor)
 
@@ -225,6 +262,28 @@ def get_monitor(monitor_id):
         "alert_sent": monitor.get("alert_sent", False),
         "logs": monitor.get("logs", [])[-50:],
     })
+
+
+@app.route("/api/monitors")
+def list_monitors():
+    all_m = _load_all_monitors()
+    result = []
+    for m in all_m.values():
+        result.append({
+            "id":           m["id"],
+            "status":       m["status"],
+            "started_at":   m["started_at"],
+            "poll_count":   m.get("poll_count", 0),
+            "last_checked": m.get("last_checked"),
+            "last_result":  m.get("last_result"),
+            "alert_sent":   m.get("alert_sent", False),
+            "movie":        m["config"].get("movie", ""),
+            "phone":        m["config"].get("phone", ""),
+            "session_id":   m["config"].get("session_id", ""),
+            "booking_url":  m["config"].get("booking_url", ""),
+        })
+    result.sort(key=lambda x: x["started_at"], reverse=True)
+    return jsonify(result)
 
 
 @app.route("/api/monitor/<monitor_id>/stop", methods=["POST"])
@@ -269,19 +328,29 @@ def _run_monitor(monitor_id):
     from playwright.sync_api import TimeoutError as PwTimeout
 
     monitor = _load_monitor(monitor_id)
-    config = monitor["config"]
-    monitor["status"] = "monitoring"
-    _save_monitor(monitor_id, monitor)
+    config  = monitor["config"]
+    mode    = config.get("mode", "session")
+
+    # listing mode: status was already set to waiting_for_session in start_monitor
+    # session mode: transition to monitoring now
+    if mode != "listing":
+        monitor["status"] = "monitoring"
+        _save_monitor(monitor_id, monitor)
+
     _add_log(monitor_id, f"Started — watching {config['movie']}", "start")
 
-    if not config["booking_url"]:
+    # Validate required URL
+    start_url = config.get("listing_url") if mode == "listing" else config.get("booking_url")
+    if not start_url:
+        monitor = _load_monitor(monitor_id)
         monitor["status"] = "error"
-        monitor["last_error"] = "No booking URL"
+        monitor["last_error"] = "No URL configured"
         _save_monitor(monitor_id, monitor)
         return
 
-    start_time = time.time()
-    first_load = True
+    start_time       = time.time()
+    first_load       = True
+    needs_navigation = False   # set True when transitioning listing → session
 
     try:
         browser = _get_browser()
@@ -303,7 +372,7 @@ def _run_monitor(monitor_id):
 
         while True:
             monitor = _load_monitor(monitor_id)
-            if not monitor or monitor["status"] != "monitoring":
+            if not monitor or monitor["status"] not in ("monitoring", "waiting_for_session"):
                 break
 
             if time.time() - start_time > MAX_RUNTIME_SECS:
@@ -312,41 +381,95 @@ def _run_monitor(monitor_id):
                 _add_log(monitor_id, "⏰ Monitor timed out after 30 minutes", "timeout")
                 break
 
-            poll_interval = _smart_interval(config.get("showtime", ""), config["poll_interval"])
+            # Always read fresh config (it may have been mutated during a mode transition)
+            config        = monitor["config"]
+            mode          = config.get("mode", "session")
+            showtime_hint = config.get("showtime") or config.get("target_showtime", "")
+            poll_interval = _smart_interval(showtime_hint, config["poll_interval"])
+
             monitor["poll_count"] = monitor.get("poll_count", 0) + 1
             _save_monitor(monitor_id, monitor)
             _add_log(monitor_id, f"Poll #{monitor['poll_count']} (every {poll_interval}s)…", "poll")
 
             try:
-                if first_load:
-                    page.goto(config["booking_url"], timeout=30_000, wait_until="domcontentloaded")
-                    first_load = False
+                # ── Navigate or reload ────────────────────────────────────────
+                if first_load or needs_navigation:
+                    nav_url = config.get("listing_url") if mode == "listing" else config.get("booking_url")
+                    page.goto(nav_url, timeout=30_000, wait_until="domcontentloaded")
+                    first_load       = False
+                    needs_navigation = False
                 else:
                     page.reload(timeout=30_000, wait_until="domcontentloaded")
 
                 page.wait_for_timeout(3000)
-                available, reason = _check_availability(
-                    page,
-                    config.get("session_id", ""),
-                    config.get("preferred_categories", []),
-                    config.get("preferred_rows", []),
-                    payload_cache,
-                )
+
+                # ── Check availability (mode-specific) ───────────────────────
+                if mode == "listing":
+                    available, reason, session_id = _check_listing_availability(
+                        page, config, monitor_id
+                    )
+                else:
+                    available, reason = _check_availability(
+                        page,
+                        config.get("session_id", ""),
+                        config.get("preferred_categories", []),
+                        config.get("preferred_rows", []),
+                        payload_cache,
+                        monitor_id=monitor_id,
+                    )
+                    session_id = None
 
                 monitor = _load_monitor(monitor_id)
                 monitor["last_checked"] = datetime.now().strftime("%H:%M:%S")
-                monitor["last_result"] = reason
-                monitor["failures"] = 0
+                monitor["last_result"]  = reason
+                monitor["failures"]     = 0
                 _save_monitor(monitor_id, monitor)
 
+                # ── Handle result ─────────────────────────────────────────────
                 if available:
-                    monitor["status"] = "seats_found"
-                    _save_monitor(monitor_id, monitor)
-                    _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
-                    _send_alert(monitor_id, config["booking_url"])
-                    break
+                    if mode == "listing":
+                        seat_url       = _build_seat_layout_url(config, session_id)
+                        preferred_rows = config.get("preferred_rows", [])
+
+                        if not preferred_rows:
+                            # No row filter → alert immediately with the seat-layout URL
+                            monitor = _load_monitor(monitor_id)
+                            monitor["status"] = "seats_found"
+                            _save_monitor(monitor_id, monitor)
+                            _add_log(monitor_id, f"✅ Show is open: {reason}", "found")
+                            _send_alert(monitor_id, seat_url)
+                            break
+
+                        else:
+                            # Has row filter → transition to session mode for row-level check
+                            _add_log(
+                                monitor_id,
+                                f"🔄 Show opened — switching to row-level monitoring ({reason})",
+                                "info",
+                            )
+                            monitor = _load_monitor(monitor_id)
+                            monitor["config"]["mode"]        = "session"
+                            monitor["config"]["session_id"]  = session_id
+                            monitor["config"]["booking_url"] = seat_url
+                            monitor["status"] = "monitoring"
+                            _save_monitor(monitor_id, monitor)
+
+                            # Reset payload cache for the new seat-layout page
+                            payload_cache    = {"snapshot": None, "source": "", "updated_at": None}
+                            needs_navigation = True
+                            # Skip the sleep — navigate immediately
+                            continue
+
+                    else:
+                        monitor = _load_monitor(monitor_id)
+                        monitor["status"] = "seats_found"
+                        _save_monitor(monitor_id, monitor)
+                        _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
+                        _send_alert(monitor_id, config["booking_url"])
+                        break
 
                 _add_log(monitor_id, f"⏳ {reason}", "poll")
+
             except PwTimeout:
                 _handle_failure(monitor_id, "Page load timed out")
             except Exception as exc:
@@ -595,8 +718,16 @@ def _capture_layout_response(response, payload_cache):
         headers = response.headers or {}
         content_type = headers.get("content-type", "").lower()
         url = response.url.lower()
-        if "json" not in content_type and not any(key in url for key in ("seat", "layout", "render", "showtime")):
+
+        # Filter: only look at JSON responses or URLs that smell like seat data
+        is_json = "json" in content_type
+        is_seat_url = any(key in url for key in ("seat", "layout", "render", "showtime", "seatlayout"))
+        if not is_json and not is_seat_url:
             return
+
+        # Log every JSON endpoint we inspect so we can see what BMS is calling
+        short_url = response.url[:120]
+        log.info("[intercept] Checking response: %s (json=%s seat_url=%s)", short_url, is_json, is_seat_url)
 
         text = response.text()
         if not text or text[:1] not in "{[":
@@ -604,11 +735,27 @@ def _capture_layout_response(response, payload_cache):
 
         data = json.loads(text)
         snapshot = _extract_layout_snapshot(data)
+
         if snapshot:
-            payload_cache["snapshot"] = snapshot
-            payload_cache["source"] = response.url
+            n_available = len(snapshot.get("available_seats", []))
+            n_rows      = len(snapshot.get("rows", []))
+            n_sections  = len(snapshot.get("sections", []))
+            payload_cache["snapshot"]   = snapshot
+            payload_cache["source"]     = response.url
             payload_cache["updated_at"] = time.time()
-    except Exception:
+            log.info(
+                "[intercept] ✅ Layout snapshot captured from %s — "
+                "%d available seats | %d rows (%s) | %d sections (%s)",
+                short_url,
+                n_available,
+                n_rows, ", ".join(snapshot.get("rows", [])[:10]),
+                n_sections, ", ".join(s["label"] for s in snapshot.get("sections", [])[:5]),
+            )
+        else:
+            # Log that we saw a JSON response but it had no renderGroups
+            log.debug("[intercept] No renderGroups in response from %s", short_url)
+    except Exception as exc:
+        log.debug("[intercept] Error processing response: %s", exc)
         return
 
 
@@ -624,7 +771,7 @@ def _summarize_matches(matches):
     return "; ".join(parts)
 
 
-def _check_availability(page, session_id, preferred_categories, preferred_rows, payload_cache):
+def _check_availability(page, session_id, preferred_categories, preferred_rows, payload_cache, monitor_id=None):
     preferred_categories = [code.upper() for code in preferred_categories or []]
     preferred_rows = [_normalize_row_label(row) for row in preferred_rows or [] if _normalize_row_label(row)]
 
@@ -700,15 +847,56 @@ def _check_availability(page, session_id, preferred_categories, preferred_rows, 
         return False, f"Could not read session data ({state_data['error']})"
 
     layout_snapshot = _extract_layout_snapshot(state_data.get("layoutData")) or payload_cache.get("snapshot")
-    categories = state_data.get("categories", [])
+    categories  = state_data.get("categories", [])
+    show_time   = state_data.get("showTime", "?")
     matching = [
         category for category in categories
         if category.get("availStatus") == "1" and category.get("range")
     ]
 
+    # ── Log snapshot diagnostics every poll ───────────────────────────────────
+    if layout_snapshot:
+        n_avail = len(layout_snapshot.get("available_seats", []))
+        rows_present = layout_snapshot.get("rows", [])
+        src = payload_cache.get("source", "inline")
+        log.info("[avail] Layout snapshot: %d available seats | rows=%s | src=%s",
+                 n_avail, rows_present[:8], src[:80])
+    else:
+        age_secs = time.time() - (payload_cache.get("updated_at") or 0)
+        log.info("[avail] No layout snapshot yet (last update %.0fs ago, source=%s)",
+                 age_secs if payload_cache.get("updated_at") else -1,
+                 payload_cache.get("source", "none"))
+
     if preferred_rows:
         if not layout_snapshot:
-            return False, "Row data unavailable on this poll"
+            # Track how many consecutive polls have had no row data
+            payload_cache["row_miss_count"] = payload_cache.get("row_miss_count", 0) + 1
+            miss = payload_cache["row_miss_count"]
+
+            # After 5 consecutive misses log a prominent warning
+            if miss == 5:
+                log.warning(
+                    "[avail] Row data missing for %d consecutive polls — "
+                    "BMS seat-layout API may not be firing on reload. "
+                    "Falling back to category-level detection.", miss
+                )
+                if monitor_id:
+                    _add_log(monitor_id,
+                             f"⚠️ Row layout API not responding after {miss} polls — "
+                             "switching to category-level detection",
+                             "warn")
+
+            # After 5 misses fall back to category-level so the monitor still fires
+            if miss >= 5:
+                if matching:
+                    cat_summary = ", ".join(f"{c['label']} ₹{c['price']}" for c in matching)
+                    return True, f"Seats open (category fallback): {cat_summary} ({show_time})"
+                return False, f"All categories sold — row layout unavailable after {miss} polls ({show_time})"
+
+            return False, f"Row layout not yet captured (poll {miss}/5 — waiting for BMS API)"
+
+        # Reset miss counter once we have data
+        payload_cache["row_miss_count"] = 0
 
         matches = [
             seat for seat in layout_snapshot.get("available_seats", [])
@@ -720,7 +908,7 @@ def _check_availability(page, session_id, preferred_categories, preferred_rows, 
         ]
 
         if matches:
-            return True, f"Selected rows open: {_summarize_matches(matches)} ({state_data.get('showTime', '?')})"
+            return True, f"Selected rows open: {_summarize_matches(matches)} ({show_time})"
 
         row_text = ", ".join(preferred_rows)
         if preferred_categories:
@@ -730,9 +918,9 @@ def _check_availability(page, session_id, preferred_categories, preferred_rows, 
                 if category.get("code", "").upper() in preferred_categories
             ]
             section_text = ", ".join(labels or preferred_categories)
-            return False, f"Rows {row_text} still unavailable in {section_text} ({state_data.get('showTime', '?')})"
+            return False, f"Rows {row_text} still unavailable in {section_text} ({show_time})"
 
-        return False, f"Rows {row_text} still unavailable ({state_data.get('showTime', '?')})"
+        return False, f"Rows {row_text} still unavailable ({show_time})"
 
     if preferred_categories:
         matching = [category for category in matching if category.get("code", "").upper() in preferred_categories]
@@ -753,6 +941,145 @@ def _check_availability(page, session_id, preferred_categories, preferred_rows, 
         return True, f"Some section is open: {summary} ({state_data.get('showTime', '?')})"
 
     return False, f"All sections sold out ({state_data.get('showTime', '?')})"
+
+
+def _build_seat_layout_url(config, session_id):
+    """
+    Construct a seat-layout URL from listing-mode config + discovered session_id.
+
+    listing_url shape:  https://in.bookmyshow.com/cinemas/{city}/{cinema-slug}/buytickets/{venueCode}/{date}
+    seat-layout shape:  https://in.bookmyshow.com/movies/{city}/seat-layout/{eventCode}/{venueCode}/{sessionId}/{date}
+    """
+    listing_url = config.get("listing_url", "")
+    m = re.search(r"/cinemas/([^/]+)/", listing_url)
+    city = m.group(1) if m else "chennai"
+    event_code = config.get("event_code", "")
+    venue_code = config.get("venue_code", "")
+    date = config.get("date", "")
+    return (
+        f"https://in.bookmyshow.com/movies/{city}/seat-layout"
+        f"/{event_code}/{venue_code}/{session_id}/{date}"
+    )
+
+
+def _check_listing_availability(page, config, monitor_id):
+    """
+    Read venueShowtimesFunctionalApi from __INITIAL_STATE__ on the cinema-specific
+    buytickets page, find the target showtime, and return:
+        (available: bool, reason: str, session_id: str | None)
+    """
+    venue_code      = config.get("venue_code", "")
+    date            = config.get("date", "")
+    target_showtime = config.get("target_showtime", "")
+    event_code      = config.get("event_code", "")
+
+    try:
+        result = page.evaluate(
+            """
+            (args) => {
+                const { venueCode, dateCode, targetShowtime, eventCode } = args;
+
+                function norm(t) {
+                    if (!t) return '';
+                    return t.replace(/\\s+/g, ' ').toUpperCase()
+                             .replace(/([0-9])(AM|PM)/, '$1 $2').trim();
+                }
+
+                try {
+                    const api = window.__INITIAL_STATE__?.venueShowtimesFunctionalApi;
+                    if (!api) return { error: 'no_venueShowtimesFunctionalApi' };
+
+                    const queryKey = 'getShowtimesByVenue-' + venueCode + '-' + dateCode;
+                    const query    = api.queries?.[queryKey];
+                    if (!query) {
+                        const keys = Object.keys(api.queries || {}).slice(0, 5);
+                        return { error: 'query_key_not_found', queryKey, available_keys: keys };
+                    }
+
+                    const events  = query?.data?.showDetailsTransformed?.Event || [];
+                    const matches = [];
+                    const targetNorm = norm(targetShowtime);
+
+                    for (const ev of events) {
+                        const evCode = String(ev.EventCode || '');
+                        if (eventCode && evCode !== eventCode) continue;
+
+                        for (const child of ev.ChildEvents || []) {
+                            for (const show of child.ShowTimes || []) {
+                                if (norm(show.ShowTime) === targetNorm) {
+                                    matches.push({
+                                        sessionId:    String(show.SessionId   || ''),
+                                        showTime:     show.ShowTime,
+                                        availStatus:  String(show.AvailStatus || ''),
+                                        showDateCode: String(show.ShowDateCode || ''),
+                                        eventCode:    evCode,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    if (matches.length === 0) {
+                        const all = [];
+                        for (const ev of events) {
+                            for (const child of ev.ChildEvents || []) {
+                                for (const show of child.ShowTimes || []) {
+                                    all.push({
+                                        showTime:    show.ShowTime,
+                                        availStatus: show.AvailStatus,
+                                        sessionId:   show.SessionId,
+                                    });
+                                }
+                            }
+                        }
+                        return { error: 'no_matching_showtime', targetShowtime, targetNorm, allShowtimes: all };
+                    }
+
+                    return { matches };
+                } catch (e) {
+                    return { error: 'js_exception: ' + e.message };
+                }
+            }
+            """,
+            {
+                "venueCode":      venue_code,
+                "dateCode":       date,
+                "targetShowtime": target_showtime,
+                "eventCode":      event_code,
+            },
+        )
+    except Exception as exc:
+        return False, f"JS evaluation failed: {str(exc)[:80]}", None
+
+    if result.get("error"):
+        err = result["error"]
+        if err == "no_venueShowtimesFunctionalApi":
+            return False, "Waiting — venue data not yet in page state", None
+        if err == "query_key_not_found":
+            keys_str = ", ".join(result.get("available_keys", []))
+            _add_log(monitor_id, f"⚠️ Query key not found ({result.get('queryKey')}), saw: {keys_str}", "warn")
+            return False, "Waiting — venue query key not found", None
+        if err == "no_matching_showtime":
+            found = [s["showTime"] for s in result.get("allShowtimes", [])]
+            target = result.get("targetShowtime", target_showtime)
+            _add_log(monitor_id, f"⚠️ Showtime '{target}' not matched. Found: {found[:6]}", "warn")
+            return False, f"Showtime '{target}' not found in venue schedule", None
+        return False, f"Page state error ({err})", None
+
+    matches = result.get("matches", [])
+    if not matches:
+        return False, "No matching session found", None
+
+    # Use first match (there should only be one for a given venue+time)
+    show = matches[0]
+    avail = show.get("availStatus", "0")
+    show_time = show.get("showTime", target_showtime)
+    session_id = show.get("sessionId", "")
+
+    if avail == "1":
+        return True, f"Show is open ({show_time})", session_id
+
+    return False, f"Show still sold out ({show_time})", None
 
 
 def _send_alert(monitor_id, booking_url):
