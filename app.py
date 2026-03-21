@@ -1,40 +1,26 @@
 """
-BookMyShow Seat Alert — Production-ready server
-================================================
-Fixes applied:
-  #1  Redis persistence (falls back to in-memory if REDIS_URL not set)
-  #2  WhatsApp pre-check before monitor starts
-  #3  Alert deduplication (alert_sent flag)
-  #4  Twilio retry with exponential backoff (3 attempts)
-  #5  Monitor timeout (30 min max)
-  #6  Shared browser instance (one per process)
-  #7  Jitter on poll interval (±random 1-3s)
-  #8  Server-side smart poll interval based on showtime proximity
-  #9  page.reload() instead of page.goto() after first load
-  #10 Fallback text scan if Playwright DOM scan fails
-  #11 Max 5 active monitors per phone (abuse prevention)
-  #14 poll_count + last_checked exposed in API
-  #15 failure counter → "error" status if threshold exceeded
-  #17 last_result exposed in API
-  #18 last_error field
-  #26 Startup env validation (warn loudly, don't crash)
-  #27 /health endpoint
+BookMyShow Seat Alert backend.
+
+Honest v1 behavior:
+- monitor one BookMyShow session at a time
+- optionally filter by selected section / price tier
+- use BookMyShow's embedded __INITIAL_STATE__ instead of scraping canvas DOM
 """
 
-import os
 import json
-import uuid
-import time
-import random
 import logging
+import os
+import random
+import re
 import threading
+import time
+import uuid
 from datetime import datetime
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from twilio.rest import Client
 
-# ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
@@ -45,144 +31,112 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Twilio config ─────────────────────────────────────────────────────────────
-TWILIO_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM  = os.environ.get("TWILIO_FROM_NUMBER", "whatsapp:+14155238886")
+TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER", "whatsapp:+14155238886")
 
-# FIX #26 — Warn loudly on startup if Twilio not configured
 if not TWILIO_SID or not TWILIO_TOKEN:
-    log.warning("=" * 60)
-    log.warning("TWILIO NOT CONFIGURED — WhatsApp alerts will not be sent!")
-    log.warning("Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN env vars.")
-    log.warning("=" * 60)
+    log.warning("TWILIO NOT CONFIGURED — WhatsApp alerts will not be sent")
 
-# ── BMS constants ─────────────────────────────────────────────────────────────
-BMS_BASE = "https://in.bookmyshow.com"
-BMS_UA   = (
+BMS_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
-MAX_ACTIVE_PER_PHONE = 5   # FIX #11
-MAX_RUNTIME_SECS     = 1800  # FIX #5  — 30 min max
-MAX_FAILURES         = 10    # FIX #15 — error out after this many consecutive failures
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX #1 — PERSISTENCE (Redis if available, else in-memory)
-# ══════════════════════════════════════════════════════════════════════════════
+MAX_ACTIVE_PER_PHONE = 5
+MAX_RUNTIME_SECS = 1800
+MAX_FAILURES = 10
 
 REDIS_URL = os.environ.get("REDIS_URL", "")
 _redis = None
+_local_monitors = {}
 
 if REDIS_URL:
     try:
         import redis as redis_lib
         _redis = redis_lib.from_url(REDIS_URL, decode_responses=True)
         _redis.ping()
-        log.info("✅ Redis connected: %s", REDIS_URL[:30])
-    except Exception as e:
-        log.warning("Redis connection failed (%s) — falling back to in-memory", e)
+    except Exception as exc:
+        log.warning("Redis connection failed (%s) — using in-memory store", exc)
         _redis = None
-else:
-    log.info("No REDIS_URL set — using in-memory store (monitors lost on restart)")
-
-# In-memory fallback
-_local_monitors = {}
 
 
-def _save_monitor(mid, data):
+def _save_monitor(monitor_id, data):
     if _redis:
-        _redis.set(f"monitor:{mid}", json.dumps(data), ex=86400)  # 24h TTL
+      _redis.set(f"monitor:{monitor_id}", json.dumps(data), ex=86400)
     else:
-        _local_monitors[mid] = data
+      _local_monitors[monitor_id] = data
 
 
-def _load_monitor(mid):
+def _load_monitor(monitor_id):
     if _redis:
-        raw = _redis.get(f"monitor:{mid}")
+        raw = _redis.get(f"monitor:{monitor_id}")
         return json.loads(raw) if raw else None
-    return _local_monitors.get(mid)
+    return _local_monitors.get(monitor_id)
 
 
 def _load_all_monitors():
     if _redis:
-        keys = _redis.keys("monitor:*")
         result = {}
-        for key in keys:
+        for key in _redis.keys("monitor:*"):
             raw = _redis.get(key)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    result[data["id"]] = data
-                except Exception:
-                    pass
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+                result[data["id"]] = data
+            except Exception:
+                continue
         return result
     return dict(_local_monitors)
 
 
-def _delete_monitor(mid):
-    if _redis:
-        _redis.delete(f"monitor:{mid}")
-    else:
-        _local_monitors.pop(mid, None)
-
-
-def _add_log(mid, message, event_type="info"):
-    """Thread-safe log append."""
-    monitor = _load_monitor(mid)
+def _add_log(monitor_id, message, event_type="info"):
+    monitor = _load_monitor(monitor_id)
     if not monitor:
         return
-    log_entry = {
+    entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
         "message": message,
-        "type": event_type,   # FIX #16 structured
+        "type": event_type,
     }
-    monitor.setdefault("logs", []).append(log_entry)
-    # Keep last 100 log entries
+    monitor.setdefault("logs", []).append(entry)
     monitor["logs"] = monitor["logs"][-100:]
-    _save_monitor(mid, monitor)
-    log.info("[%s] %s", mid, message)
+    _save_monitor(monitor_id, monitor)
+    log.info("[%s] %s", monitor_id, message)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX #6 — SHARED BROWSER INSTANCE
-# ══════════════════════════════════════════════════════════════════════════════
-
-_browser_lock    = threading.Lock()
+_browser_lock = threading.Lock()
 _shared_playwright = None
-_shared_browser    = None
+_shared_browser = None
 
 
 def _get_browser():
-    """Return a shared Chromium browser instance. Create if needed."""
     global _shared_playwright, _shared_browser
     with _browser_lock:
         if _shared_browser and _shared_browser.is_connected():
             return _shared_browser
-        # Launch fresh
+
         from playwright.sync_api import sync_playwright
+
         if _shared_playwright:
-            try: _shared_playwright.stop()
-            except: pass
+            try:
+                _shared_playwright.stop()
+            except Exception:
+                pass
+
         _shared_playwright = sync_playwright().start()
         _shared_browser = _shared_playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        log.info("🌐 Browser launched (shared instance)")
         return _shared_browser
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/health")  # FIX #27
+@app.route("/health")
 def health():
     monitors = _load_all_monitors()
-    active = sum(1 for m in monitors.values() if m.get("status") == "monitoring")
+    active = sum(1 for monitor in monitors.values() if monitor.get("status") == "monitoring")
     return jsonify({
         "status": "ok",
         "active_monitors": active,
@@ -198,53 +152,53 @@ def start_monitor():
     data = request.json or {}
     phone = data.get("phone", "").strip()
 
-    # FIX #11 — max active monitors per phone
-    all_monitors = _load_all_monitors()
     active_for_phone = sum(
-        1 for m in all_monitors.values()
-        if m.get("config", {}).get("phone") == phone
-        and m.get("status") == "monitoring"
+        1 for monitor in _load_all_monitors().values()
+        if monitor.get("config", {}).get("phone") == phone
+        and monitor.get("status") == "monitoring"
     )
     if active_for_phone >= MAX_ACTIVE_PER_PHONE:
-        return jsonify({
-            "error": f"You already have {active_for_phone} active monitors. Stop one first."
-        }), 429
+        return jsonify({"error": f"You already have {active_for_phone} active monitors. Stop one first."}), 429
+
+    booking_url = data.get("booking_url", "")
+    url_match = re.search(r"/seat-layout/[^/]+/[^/]+/([^/]+)/", booking_url)
+    session_id = url_match.group(1) if url_match else str(data.get("show_id", "")).strip()
+    preferred_categories = [
+        str(code).strip().upper()
+        for code in data.get("preferred_categories", []) or []
+        if str(code).strip()
+    ]
 
     monitor_id = str(uuid.uuid4())[:8]
-
-    # FIX #8 — server-side adaptive poll interval
-    client_interval = int(data.get("poll_interval", 20))
-    server_interval  = _smart_interval(data.get("showtime", ""), client_interval)
-
     config = {
-        "movie":         data.get("movie", ""),
-        "theatre":       data.get("theatre", ""),
-        "showtime":      data.get("showtime", ""),
-        "booking_url":   data.get("booking_url", ""),
-        "phone":         phone,
-        "preferred_row": data.get("preferred_row", ""),
-        "poll_interval": server_interval,
+        "movie": data.get("movie", ""),
+        "theatre": data.get("theatre", ""),
+        "showtime": data.get("showtime", ""),
+        "booking_url": booking_url,
+        "phone": phone,
+        "poll_interval": _smart_interval(data.get("showtime", ""), int(data.get("poll_interval", 20))),
+        "session_id": session_id,
+        "preferred_categories": preferred_categories,
     }
 
     monitor = {
-        "id":           monitor_id,
-        "config":       config,
-        "status":       "starting",
-        "started_at":   datetime.now().isoformat(),
-        "poll_count":   0,
+        "id": monitor_id,
+        "config": config,
+        "status": "starting",
+        "started_at": datetime.now().isoformat(),
+        "poll_count": 0,
         "last_checked": None,
-        "last_result":  None,
-        "last_error":   None,   # FIX #18
-        "alert_sent":   False,
-        "failures":     0,
-        "logs":         [],
+        "last_result": None,
+        "last_error": None,
+        "alert_sent": False,
+        "failures": 0,
+        "logs": [],
     }
     _save_monitor(monitor_id, monitor)
 
     thread = threading.Thread(target=_run_monitor, args=(monitor_id,), daemon=True)
     thread.start()
-
-    return jsonify({"monitor_id": monitor_id, "status": "started", "poll_interval": server_interval})
+    return jsonify({"monitor_id": monitor_id, "status": "started", "poll_interval": config["poll_interval"]})
 
 
 @app.route("/api/monitor/<monitor_id>")
@@ -253,37 +207,16 @@ def get_monitor(monitor_id):
     if not monitor:
         return jsonify({"error": "Not found"}), 404
     return jsonify({
-        "id":           monitor["id"],
-        "status":       monitor["status"],
-        "started_at":   monitor["started_at"],
-        "poll_count":   monitor.get("poll_count", 0),
+        "id": monitor["id"],
+        "status": monitor["status"],
+        "started_at": monitor["started_at"],
+        "poll_count": monitor.get("poll_count", 0),
         "last_checked": monitor.get("last_checked"),
-        "last_result":  monitor.get("last_result"),   # FIX #17
-        "last_error":   monitor.get("last_error"),    # FIX #18
-        "alert_sent":   monitor.get("alert_sent", False),
-        "logs":         monitor.get("logs", [])[-50:],
+        "last_result": monitor.get("last_result"),
+        "last_error": monitor.get("last_error"),
+        "alert_sent": monitor.get("alert_sent", False),
+        "logs": monitor.get("logs", [])[-50:],
     })
-
-
-@app.route("/api/monitors")
-def list_monitors():
-    all_m = _load_all_monitors()
-    result = []
-    for m in all_m.values():
-        result.append({
-            "id":           m["id"],
-            "status":       m["status"],
-            "started_at":   m["started_at"],
-            "poll_count":   m.get("poll_count", 0),
-            "last_checked": m.get("last_checked"),
-            "last_result":  m.get("last_result"),
-            "alert_sent":   m.get("alert_sent", False),
-            "movie":        m["config"].get("movie", ""),
-            "phone":        m["config"].get("phone", ""),
-            "booking_url":  m["config"].get("booking_url", ""),
-        })
-    result.sort(key=lambda x: x["started_at"], reverse=True)
-    return jsonify(result)
 
 
 @app.route("/api/monitor/<monitor_id>/stop", methods=["POST"])
@@ -306,46 +239,37 @@ def test_whatsapp():
 
     if not phone.startswith("+"):
         phone = f"+91{phone}"
-    to = f"whatsapp:{phone}"
 
-    message = (
-        "👋 *BMS Seat Alert — Test Message*\n\n"
-        "✅ WhatsApp alerts are working!\n"
-        "You'll get a message like this when your rows open up.\n\n"
-        "_Powered by BMS Seat Alert_"
+    if not TWILIO_SID or not TWILIO_TOKEN:
+        return jsonify({"error": "Twilio credentials not configured on server"}), 500
+
+    client = Client(TWILIO_SID, TWILIO_TOKEN)
+    msg = client.messages.create(
+        body=(
+            "👋 *BMS Seat Alert — Test Message*\n\n"
+            "✅ WhatsApp alerts are working!\n"
+            "You'll get a message like this when your selected section opens up.\n\n"
+            "_Powered by BMS Seat Alert_"
+        ),
+        from_=TWILIO_FROM,
+        to=f"whatsapp:{phone}",
     )
+    return jsonify({"status": "sent", "sid": msg.sid, "to": phone})
 
-    try:
-        if not TWILIO_SID or not TWILIO_TOKEN:
-            return jsonify({"error": "Twilio credentials not configured on server"}), 500
-        client = Client(TWILIO_SID, TWILIO_TOKEN)
-        msg = client.messages.create(body=message, from_=TWILIO_FROM, to=to)
-        return jsonify({"status": "sent", "sid": msg.sid, "to": phone})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MONITORING ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _run_monitor(monitor_id):
-    """Background polling loop — one thread per monitor."""
     from playwright.sync_api import TimeoutError as PwTimeout
 
     monitor = _load_monitor(monitor_id)
-    config  = monitor["config"]
+    config = monitor["config"]
     monitor["status"] = "monitoring"
     _save_monitor(monitor_id, monitor)
     _add_log(monitor_id, f"Started — watching {config['movie']}", "start")
 
-    booking_url = config["booking_url"]
-    if not booking_url:
-        monitor = _load_monitor(monitor_id)
+    if not config["booking_url"]:
         monitor["status"] = "error"
         monitor["last_error"] = "No booking URL"
         _save_monitor(monitor_id, monitor)
-        _add_log(monitor_id, "Error: no booking URL", "error")
         return
 
     start_time = time.time()
@@ -353,87 +277,88 @@ def _run_monitor(monitor_id):
 
     try:
         browser = _get_browser()
-        context = browser.new_context(user_agent=BMS_UA)
-        page    = context.new_page()
-        page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda r: r.abort())
+        context = browser.new_context(
+            user_agent=BMS_UA,
+            viewport={"width": 1280, "height": 900},
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        page = context.new_page()
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+        """)
+        page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda route: route.abort())
 
         while True:
-            # Re-read latest state from store (so stop signal is picked up)
             monitor = _load_monitor(monitor_id)
             if not monitor or monitor["status"] != "monitoring":
                 break
 
-            # FIX #5 — timeout after MAX_RUNTIME_SECS
             if time.time() - start_time > MAX_RUNTIME_SECS:
                 monitor["status"] = "timeout"
                 _save_monitor(monitor_id, monitor)
                 _add_log(monitor_id, "⏰ Monitor timed out after 30 minutes", "timeout")
                 break
 
-            # FIX #8 — recalculate interval each poll (showtime gets closer)
             poll_interval = _smart_interval(config.get("showtime", ""), config["poll_interval"])
-
             monitor["poll_count"] = monitor.get("poll_count", 0) + 1
-            poll_num = monitor["poll_count"]
             _save_monitor(monitor_id, monitor)
-            _add_log(monitor_id, f"Poll #{poll_num} (every {poll_interval}s)…", "poll")
+            _add_log(monitor_id, f"Poll #{monitor['poll_count']} (every {poll_interval}s)…", "poll")
 
             try:
-                # FIX #9 — reload instead of full goto after first load
                 if first_load:
-                    page.goto(booking_url, timeout=30_000, wait_until="domcontentloaded")
+                    page.goto(config["booking_url"], timeout=30_000, wait_until="domcontentloaded")
                     first_load = False
                 else:
                     page.reload(timeout=30_000, wait_until="domcontentloaded")
 
-                page.wait_for_timeout(3500)  # BMS seat map needs time to render
-
-                available, reason = _check_rows(page, config["preferred_row"])
+                page.wait_for_timeout(3000)
+                available, reason = _check_availability(
+                    page,
+                    config.get("session_id", ""),
+                    config.get("preferred_categories", []),
+                )
 
                 monitor = _load_monitor(monitor_id)
                 monitor["last_checked"] = datetime.now().strftime("%H:%M:%S")
-                monitor["last_result"]  = reason
-                monitor["failures"]     = 0  # reset on success
+                monitor["last_result"] = reason
+                monitor["failures"] = 0
                 _save_monitor(monitor_id, monitor)
 
                 if available:
-                    _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
-                    monitor = _load_monitor(monitor_id)
                     monitor["status"] = "seats_found"
                     _save_monitor(monitor_id, monitor)
-                    _send_alert(monitor_id, booking_url)
+                    _add_log(monitor_id, f"✅ SEATS FOUND: {reason}", "found")
+                    _send_alert(monitor_id, config["booking_url"])
                     break
-                else:
-                    _add_log(monitor_id, f"⏳ {reason}", "poll")
 
+                _add_log(monitor_id, f"⏳ {reason}", "poll")
             except PwTimeout:
                 _handle_failure(monitor_id, "Page load timed out")
-            except Exception as e:
-                err = str(e)[:100]
-                _handle_failure(monitor_id, f"Error: {err}")
+            except Exception as exc:
+                _handle_failure(monitor_id, f"Error: {str(exc)[:100]}")
                 monitor = _load_monitor(monitor_id)
-                if monitor.get("failures", 0) >= MAX_FAILURES:
+                if monitor and monitor.get("failures", 0) >= MAX_FAILURES:
                     monitor["status"] = "error"
                     _save_monitor(monitor_id, monitor)
                     _add_log(monitor_id, "❌ Too many failures, stopping", "error")
                     break
 
-            # FIX #7 — jitter ±random 1-3s to avoid bot detection
-            jitter = random.uniform(1, 3)
-            time.sleep(poll_interval + jitter)
+            time.sleep(poll_interval + random.uniform(1, 3))
 
         try:
             context.close()
         except Exception:
             pass
-
-    except Exception as e:
+    except Exception as exc:
         monitor = _load_monitor(monitor_id)
         if monitor:
             monitor["status"] = "error"
-            monitor["last_error"] = str(e)[:100]
+            monitor["last_error"] = str(exc)[:100]
             _save_monitor(monitor_id, monitor)
-        _add_log(monitor_id, f"❌ Fatal error: {str(e)[:80]}", "error")
+        _add_log(monitor_id, f"❌ Fatal error: {str(exc)[:80]}", "error")
 
 
 def _handle_failure(monitor_id, message):
@@ -446,210 +371,120 @@ def _handle_failure(monitor_id, message):
     _add_log(monitor_id, f"⚠️ {message} (failure #{monitor['failures']})", "warn")
 
 
-def _smart_interval(showtime_str: str, default: int = 20) -> int:
-    """Return poll interval in seconds based on how close the show is."""
+def _smart_interval(showtime_str, default=20):
     if not showtime_str:
         return default
     try:
-        match = __import__("re").search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", showtime_str, __import__("re").IGNORECASE)
+        match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", showtime_str, re.IGNORECASE)
         if not match:
             return default
-        h, m, ampm = int(match.group(1)), int(match.group(2)), match.group(3).upper()
-        if ampm == "PM" and h != 12: h += 12
-        if ampm == "AM" and h == 12: h = 0
-        now   = datetime.now()
-        show  = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        diff  = (show - now).total_seconds() / 60
-        if diff < 0:   return default
-        if diff < 30:  return 5
-        if diff < 120: return 10
-        if diff < 360: return 15
+        hours = int(match.group(1))
+        mins = int(match.group(2))
+        ampm = match.group(3).upper()
+        if ampm == "PM" and hours != 12:
+            hours += 12
+        if ampm == "AM" and hours == 12:
+            hours = 0
+        now = datetime.now()
+        show = now.replace(hour=hours, minute=mins, second=0, microsecond=0)
+        diff = (show - now).total_seconds() / 60
+        if diff < 0:
+            return default
+        if diff < 30:
+            return 5
+        if diff < 120:
+            return 10
+        if diff < 360:
+            return 15
         return 30
     except Exception:
         return default
 
 
-def _check_rows(page, preferred_rows: str) -> tuple:
-    """
-    Robust seat detection for BookMyShow.
-
-    Works for both open shows AND sold-out shows (watches for cancellations).
-
-    Strategy:
-    1. Count all seat elements — if < 10, page hasn't loaded yet
-    2. Count AVAILABLE seats (no sold/booked/blocked class)
-    3. If no row preference → alert when any available seat exists
-    4. Try row-level DOM detection for specific rows
-    5. Fallback: if row detection fails but available seats > 0 → alert
-    6. Never alert when 0 available seats (even if sold-out text is absent)
-    """
+def _check_availability(page, session_id, preferred_categories):
+    preferred_categories = [code.upper() for code in preferred_categories or []]
 
     try:
-        page_text = page.inner_text("body").lower()
-    except Exception:
-        return False, "Page not ready"
+        state_data = page.evaluate("""
+        (sessionId) => {
+            try {
+                const seatLayout = window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData;
+                if (!seatLayout) return { error: "no_initial_state" };
 
-    # Normalize preferred rows
-    rows_list = [r.strip().upper() for r in preferred_rows.split(",") if r.strip()]
+                const venue = seatLayout.currentVenue;
+                if (!venue) return { error: "no_venue" };
 
-    # ─────────────────────────────────────────────
-    # 1. COLLECT ALL SEATS
-    # ─────────────────────────────────────────────
-    try:
-        all_seats = page.query_selector_all(
-            '[class*="seat"], [class*="Seat"], [class*="__seat"], [class*="_seat"]'
-        )
-    except Exception:
-        all_seats = []
-
-    seat_count = len(all_seats)
-    log.info("[seat-scan] Total seat elements: %d", seat_count)
-
-    if seat_count < 10:
-        # Page not loaded / seats not rendered yet
-        if any(p in page_text for p in ["sold out", "housefull", "no seats available"]):
-            return False, "Show appears sold out — watching for cancellations"
-        return False, "Seat map not loaded yet — waiting"
-
-    # ─────────────────────────────────────────────
-    # 2. COUNT AVAILABLE SEATS
-    # ─────────────────────────────────────────────
-    _booked_keywords = ["sold", "booked", "unavail", "disabled", "blocked", "locked"]
-    available_count = 0
-    for s in all_seats:
-        cls = (s.get_attribute("class") or "").lower()
-        if not any(w in cls for w in _booked_keywords):
-            available_count += 1
-
-    log.info("[seat-scan] Available: %d / %d seats", available_count, seat_count)
-
-    # ─────────────────────────────────────────────
-    # 3. NO ROW PREFERENCE → alert if ANY seat open
-    # ─────────────────────────────────────────────
-    if not rows_list:
-        if available_count > 0:
-            return True, f"Seats available! ({available_count} of {seat_count} open)"
-        return False, f"Seat map visible ({seat_count} seats, all booked) — watching for cancellations"
-
-    # ─────────────────────────────────────────────
-    # 4. ROW-LEVEL DETECTION (best effort via JS)
-    # ─────────────────────────────────────────────
-    try:
-        result = page.evaluate("""
-        (targetRows) => {
-            const rowsFound = {};
-            const debug = [];
-
-            const seatEls = Array.from(document.querySelectorAll(
-                '[class*="seat"], [class*="Seat"], [class*="__seat"], [class*="_seat"]'
-            )).filter(el => {
-                const r = el.getBoundingClientRect();
-                return r.width > 4 && r.width < 80 && r.height > 4 && r.height < 80;
-            });
-
-            debug.push(`visible_seats:${seatEls.length}`);
-
-            for (const seat of seatEls) {
-                const cls = (seat.className || '').toLowerCase();
-                const isAvailable =
-                    !cls.includes('sold')     &&
-                    !cls.includes('booked')   &&
-                    !cls.includes('unavail')  &&
-                    !cls.includes('disabled') &&
-                    !cls.includes('blocked')  &&
-                    !cls.includes('locked');
-
-                if (!isAvailable) continue;
-
-                let node = seat;
-                let rowLabel = null;
-
-                // Walk up DOM (max 6 levels) to find a row label sibling/ancestor text
-                for (let i = 0; i < 6 && node; i++) {
-                    node = node.parentElement;
-                    if (!node) break;
-
-                    // Check innerText of this container — if it's short and looks like A/AA it's the row label
-                    const directText = (node.innerText || '').split('\\n')[0].trim();
-                    const clean = directText.replace(/[^A-Za-z]/g, '').toUpperCase();
-                    if (/^[A-Z]{1,2}$/.test(clean) && directText.length <= 4) {
-                        rowLabel = clean;
-                        break;
-                    }
-
-                    // Also check for a label child element
-                    for (const child of node.children) {
-                        const raw = (child.innerText || child.textContent || '').trim();
-                        const c2  = raw.replace(/[^A-Za-z]/g, '').toUpperCase();
-                        if (/^[A-Z]{1,2}$/.test(c2) && raw.length <= 4) {
-                            rowLabel = c2;
-                            break;
-                        }
-                    }
-                    if (rowLabel) break;
+                const allShows = venue.ShowTimes || [];
+                const show = allShows.find((item) => String(item.SessionId) === String(sessionId));
+                if (!show) {
+                    return {
+                        error: "no_show_found",
+                        allSessions: allShows.map((item) => ({ id: item.SessionId, time: item.ShowTime }))
+                    };
                 }
 
-                if (rowLabel) {
-                    rowsFound[rowLabel] = (rowsFound[rowLabel] || 0) + 1;
-                }
+                return {
+                    sessionId: show.SessionId,
+                    showTime: show.ShowTime,
+                    categories: (show.Categories || []).map((item) => ({
+                        code: String(item.PriceCode || ""),
+                        label: String(item.PriceDesc || item.PriceCode || ""),
+                        availStatus: String(item.AvailStatus || ""),
+                        range: String(item.CategoryRange || ""),
+                        price: String(item.CurPrice || ""),
+                    })),
+                };
+            } catch (error) {
+                return { error: "js_exception: " + error.message };
             }
-
-            debug.push(`rows_mapped:${Object.keys(rowsFound).join(',') || 'none'}`);
-            return { rowsFound, debug };
         }
-        """, rows_list)
+        """, session_id)
+    except Exception as exc:
+        return False, f"State evaluation failed: {str(exc)[:80]}"
 
-        rows_found = result.get("rowsFound", {})
-        for d in result.get("debug", []):
-            log.info("[seat-scan] %s", d)
-        log.info("[seat-scan] Row map: %s", rows_found)
+    if state_data.get("error"):
+        return False, f"Could not read session data ({state_data['error']})"
 
-        # Matched preferred rows
-        for row in rows_list:
-            if row in rows_found and rows_found[row] > 0:
-                return True, f"Row {row} available ({rows_found[row]} seats)"
+    categories = state_data.get("categories", [])
+    matching = [
+        category for category in categories
+        if category.get("availStatus") == "1" and category.get("range")
+    ]
 
-        # Row mapping worked but preferred rows have no available seats
-        if rows_found:
-            return False, (
-                f"No available seats in rows {preferred_rows} yet "
-                f"(found rows: {','.join(rows_found.keys())} · "
-                f"{available_count}/{seat_count} total available)"
-            )
+    if preferred_categories:
+        matching = [category for category in matching if category.get("code", "").upper() in preferred_categories]
+        if matching:
+            summary = ", ".join(f"{cat['label']} ₹{cat['price']}" for cat in matching)
+            return True, f"Selected sections open: {summary} ({state_data.get('showTime', '?')})"
 
-    except Exception as e:
-        log.warning("[seat-scan] Row detection failed: %s — using fallback", e)
+        watched_labels = [
+            category.get("label") or category.get("code")
+            for category in categories
+            if category.get("code", "").upper() in preferred_categories
+        ]
+        watched_text = ", ".join(watched_labels or preferred_categories)
+        return False, f"Selected sections still sold out: {watched_text} ({state_data.get('showTime', '?')})"
 
-    # ─────────────────────────────────────────────
-    # 5. FALLBACK: row detection failed/mapped nothing
-    #    Only alert if actual available seats exist
-    # ─────────────────────────────────────────────
-    if available_count > 0:
-        return True, f"Seats available (fallback) — {available_count} of {seat_count} open"
+    if matching:
+        summary = ", ".join(f"{cat['label']} ₹{cat['price']}" for cat in matching)
+        return True, f"Some section is open: {summary} ({state_data.get('showTime', '?')})"
 
-    # ─────────────────────────────────────────────
-    # 6. NOTHING AVAILABLE
-    # ─────────────────────────────────────────────
-    return False, f"No available seats yet ({seat_count} seats, all booked)"
+    return False, f"All sections sold out ({state_data.get('showTime', '?')})"
 
 
 def _send_alert(monitor_id, booking_url):
-    """Send WhatsApp alert — FIX #3 deduplication + FIX #4 retry."""
     monitor = _load_monitor(monitor_id)
     if not monitor:
         return
 
-    # FIX #3 — deduplicate
     if monitor.get("alert_sent"):
         _add_log(monitor_id, "Alert already sent — skipping duplicate", "info")
         return
 
-    # Mark immediately to prevent race conditions
     monitor["alert_sent"] = True
     _save_monitor(monitor_id, monitor)
 
-    config = monitor["config"]
-    phone  = config["phone"]
+    phone = monitor["config"]["phone"]
     if not phone.startswith("whatsapp:"):
         phone = f"whatsapp:{phone}"
     if not phone.startswith("whatsapp:+"):
@@ -657,11 +492,14 @@ def _send_alert(monitor_id, booking_url):
 
     message = (
         f"🚨 *Seats Available!*\n\n"
-        f"🎬 {config['movie']}\n"
+        f"🎬 {monitor['config']['movie']}\n"
     )
-    if config.get("theatre"):  message += f"🏠 {config['theatre']}\n"
-    if config.get("showtime"): message += f"🕐 {config['showtime']}\n"
-    if monitor.get("last_result"): message += f"💺 {monitor['last_result']}\n"
+    if monitor["config"].get("theatre"):
+        message += f"🏠 {monitor['config']['theatre']}\n"
+    if monitor["config"].get("showtime"):
+        message += f"🕐 {monitor['config']['showtime']}\n"
+    if monitor.get("last_result"):
+        message += f"💺 {monitor['last_result']}\n"
     message += f"\n👉 Book now: {booking_url}\n"
     message += f"\n_Alert at {datetime.now().strftime('%H:%M')}_"
 
@@ -669,28 +507,25 @@ def _send_alert(monitor_id, booking_url):
         _add_log(monitor_id, "⚠️ Twilio not configured — alert not sent", "warn")
         return
 
-    # FIX #4 — retry up to 3 times with exponential backoff
     client = Client(TWILIO_SID, TWILIO_TOKEN)
     for attempt in range(3):
         try:
             msg = client.messages.create(body=message, from_=TWILIO_FROM, to=phone)
-            _add_log(monitor_id, f"✅ WhatsApp sent (attempt {attempt+1}) SID: {msg.sid}", "alert")
+            _add_log(monitor_id, f"✅ WhatsApp sent (attempt {attempt + 1}) SID: {msg.sid}", "alert")
             return
-        except Exception as e:
-            wait = 2 ** attempt  # 1s, 2s, 4s
-            _add_log(monitor_id, f"⚠️ Twilio attempt {attempt+1} failed: {str(e)[:60]} — retry in {wait}s", "warn")
+        except Exception as exc:
+            wait = 2 ** attempt
+            _add_log(monitor_id, f"⚠️ Twilio attempt {attempt + 1} failed: {str(exc)[:60]} — retry in {wait}s", "warn")
             if attempt < 2:
                 time.sleep(wait)
 
-    _add_log(monitor_id, "❌ All 3 WhatsApp send attempts failed", "error")
-    # Reset flag so a future attempt can retry
     monitor = _load_monitor(monitor_id)
     if monitor:
         monitor["alert_sent"] = False
         _save_monitor(monitor_id, monitor)
+    _add_log(monitor_id, "❌ All 3 WhatsApp send attempts failed", "error")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
