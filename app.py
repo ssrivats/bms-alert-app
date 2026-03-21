@@ -1,10 +1,11 @@
 """
 BookMyShow Seat Alert backend.
 
-Honest v1 behavior:
+Row-aware behavior:
 - monitor one BookMyShow session at a time
 - optionally filter by selected section / price tier
-- use BookMyShow's embedded __INITIAL_STATE__ instead of scraping canvas DOM
+- optionally filter by selected row letters
+- capture seat-layout payloads instead of scraping canvas DOM
 """
 
 import json
@@ -15,6 +16,7 @@ import re
 import threading
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -168,6 +170,11 @@ def start_monitor():
         for code in data.get("preferred_categories", []) or []
         if str(code).strip()
     ]
+    preferred_rows = sorted({
+        _normalize_row_label(row)
+        for row in data.get("preferred_rows", []) or []
+        if _normalize_row_label(row)
+    })
 
     monitor_id = str(uuid.uuid4())[:8]
     config = {
@@ -179,6 +186,7 @@ def start_monitor():
         "poll_interval": _smart_interval(data.get("showtime", ""), int(data.get("poll_interval", 20))),
         "session_id": session_id,
         "preferred_categories": preferred_categories,
+        "preferred_rows": preferred_rows,
     }
 
     monitor = {
@@ -284,12 +292,14 @@ def _run_monitor(monitor_id):
             timezone_id="Asia/Kolkata",
         )
         page = context.new_page()
+        payload_cache = {"snapshot": None, "source": "", "updated_at": None}
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             window.chrome = { runtime: {} };
         """)
         page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda route: route.abort())
+        page.on("response", lambda response: _capture_layout_response(response, payload_cache))
 
         while True:
             monitor = _load_monitor(monitor_id)
@@ -319,6 +329,8 @@ def _run_monitor(monitor_id):
                     page,
                     config.get("session_id", ""),
                     config.get("preferred_categories", []),
+                    config.get("preferred_rows", []),
+                    payload_cache,
                 )
 
                 monitor = _load_monitor(monitor_id)
@@ -401,12 +413,253 @@ def _smart_interval(showtime_str, default=20):
         return default
 
 
-def _check_availability(page, session_id, preferred_categories):
+def _normalize_row_label(value):
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    match = re.match(r"([A-Z]+[0-9]*|[0-9]+[A-Z]*)", text)
+    return match.group(1) if match else ""
+
+
+def _normalize_section_code(value):
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").strip().upper())
+
+
+def _walk_nodes(node, depth=0, seen=None):
+    if seen is None:
+        seen = set()
+    if depth > 12:
+        return
+    if isinstance(node, dict):
+        marker = id(node)
+        if marker in seen:
+            return
+        seen.add(marker)
+        yield node
+        for value in node.values():
+            yield from _walk_nodes(value, depth + 1, seen)
+    elif isinstance(node, list):
+        marker = id(node)
+        if marker in seen:
+            return
+        seen.add(marker)
+        for item in node:
+            yield from _walk_nodes(item, depth + 1, seen)
+
+
+def _find_render_data(node):
+    if isinstance(node, dict) and isinstance(node.get("renderGroups"), list):
+        return node
+
+    for candidate in _walk_nodes(node):
+        if isinstance(candidate.get("renderGroups"), list):
+            return candidate
+    return None
+
+
+def _extract_layout_snapshot(node):
+    render_data = _find_render_data(node)
+    if not render_data:
+        return None
+
+    all_rows = set()
+    sections = {}
+    available_seats = []
+
+    for group in render_data.get("renderGroups") or []:
+        group_section = group.get("currentSeatArea") if isinstance(group, dict) else {}
+        seats = group.get("seats") if isinstance(group, dict) else None
+        if not isinstance(seats, list):
+            continue
+
+        for entry in seats:
+            if not isinstance(entry, dict):
+                continue
+
+            seat = entry.get("seat") if isinstance(entry.get("seat"), dict) else entry
+            merged = {}
+            merged.update(group if isinstance(group, dict) else {})
+            merged.update(entry)
+            if isinstance(seat, dict):
+                merged.update(seat)
+
+            row = _normalize_row_label(
+                merged.get("rowNumber")
+                or merged.get("rowNo")
+                or merged.get("rowLabel")
+                or merged.get("rowId")
+            )
+            if not row:
+                continue
+
+            seat_type = str(
+                merged.get("seatType")
+                or merged.get("type")
+                or merged.get("seatStatus")
+                or ""
+            ).strip()
+            if "GANGWAY" in seat_type.upper() or "SPACE" in seat_type.upper():
+                continue
+
+            all_rows.add(row)
+
+            area = merged.get("currentSeatArea") if isinstance(merged.get("currentSeatArea"), dict) else {}
+            if not area and isinstance(group_section, dict):
+                area = group_section
+
+            section_code = _normalize_section_code(
+                area.get("areaCode")
+                or merged.get("areaCode")
+                or area.get("areaId")
+                or merged.get("areaId")
+                or merged.get("PriceCode")
+            )
+            section_label = (
+                area.get("areaDesc")
+                or area.get("areaName")
+                or area.get("name")
+                or merged.get("priceDescription")
+                or merged.get("PriceDesc")
+                or section_code
+                or "Unknown"
+            )
+            if section_code:
+                sections[section_code] = str(section_label).strip() or section_code
+
+            if _seat_is_available(merged):
+                available_seats.append({
+                    "row": row,
+                    "section_code": section_code,
+                    "section_label": str(section_label).strip() or section_code or "Unknown",
+                    "seat_number": str(
+                        merged.get("seatNumber")
+                        or merged.get("actualSeatNo")
+                        or merged.get("cinemaSeatNumber")
+                        or merged.get("seatNo")
+                        or merged.get("seatId")
+                        or ""
+                    ).strip(),
+                })
+
+    if not all_rows and not available_seats:
+        return None
+
+    return {
+        "rows": sorted(all_rows),
+        "sections": [{"code": code, "label": label} for code, label in sections.items()],
+        "available_seats": available_seats,
+    }
+
+
+def _seat_is_available(seat):
+    if not isinstance(seat, dict):
+        return False
+
+    sold = bool(seat.get("isSold") or seat.get("sold"))
+    blocked = bool(seat.get("isBlocked") or seat.get("blocked"))
+    if sold or blocked:
+        return False
+
+    for key in ("isAvailable", "available", "isOpen"):
+        if seat.get(key) is True:
+            return True
+
+    status_values = [
+        seat.get("seatStatus"),
+        seat.get("status"),
+        seat.get("seatType"),
+        seat.get("availability"),
+    ]
+    text = " ".join(str(value or "").strip().lower() for value in status_values if value not in (None, ""))
+    if any(token in text for token in ("sold", "booked", "blocked", "unavailable", "not available")):
+        return False
+    if any(token in text for token in ("available", "vacant", "open")):
+        return True
+
+    numeric_values = [
+        seat.get("seatStatus"),
+        seat.get("status"),
+        seat.get("availabilityStatus"),
+    ]
+    for value in numeric_values:
+        if str(value).strip() == "1":
+            return True
+        if str(value).strip() == "0":
+            return False
+
+    return False
+
+
+def _capture_layout_response(response, payload_cache):
+    try:
+        headers = response.headers or {}
+        content_type = headers.get("content-type", "").lower()
+        url = response.url.lower()
+        if "json" not in content_type and not any(key in url for key in ("seat", "layout", "render", "showtime")):
+            return
+
+        text = response.text()
+        if not text or text[:1] not in "{[":
+            return
+
+        data = json.loads(text)
+        snapshot = _extract_layout_snapshot(data)
+        if snapshot:
+            payload_cache["snapshot"] = snapshot
+            payload_cache["source"] = response.url
+            payload_cache["updated_at"] = time.time()
+    except Exception:
+        return
+
+
+def _summarize_matches(matches):
+    grouped = defaultdict(set)
+    for seat in matches:
+        label = seat.get("section_label") or seat.get("section_code") or "Unknown"
+        grouped[label].add(seat.get("row") or "?")
+
+    parts = []
+    for label, rows in sorted(grouped.items()):
+        parts.append(f"{label} rows {', '.join(sorted(rows))}")
+    return "; ".join(parts)
+
+
+def _check_availability(page, session_id, preferred_categories, preferred_rows, payload_cache):
     preferred_categories = [code.upper() for code in preferred_categories or []]
+    preferred_rows = [_normalize_row_label(row) for row in preferred_rows or [] if _normalize_row_label(row)]
 
     try:
         state_data = page.evaluate("""
         (sessionId) => {
+            function findRenderData(root) {
+                const seen = new WeakSet();
+                function walk(node, depth) {
+                    if (!node || depth > 10) return null;
+                    if (typeof node !== 'object') return null;
+                    if (seen.has(node)) return null;
+                    seen.add(node);
+
+                    if (Array.isArray(node.renderGroups)) {
+                        return node;
+                    }
+
+                    if (Array.isArray(node)) {
+                        for (const item of node) {
+                            const found = walk(item, depth + 1);
+                            if (found) return found;
+                        }
+                        return null;
+                    }
+
+                    for (const value of Object.values(node)) {
+                        const found = walk(value, depth + 1);
+                        if (found) return found;
+                    }
+                    return null;
+                }
+                return walk(root, 0);
+            }
+
             try {
                 const seatLayout = window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData;
                 if (!seatLayout) return { error: "no_initial_state" };
@@ -426,6 +679,7 @@ def _check_availability(page, session_id, preferred_categories):
                 return {
                     sessionId: show.SessionId,
                     showTime: show.ShowTime,
+                    layoutData: findRenderData(seatLayout),
                     categories: (show.Categories || []).map((item) => ({
                         code: String(item.PriceCode || ""),
                         label: String(item.PriceDesc || item.PriceCode || ""),
@@ -445,11 +699,40 @@ def _check_availability(page, session_id, preferred_categories):
     if state_data.get("error"):
         return False, f"Could not read session data ({state_data['error']})"
 
+    layout_snapshot = _extract_layout_snapshot(state_data.get("layoutData")) or payload_cache.get("snapshot")
     categories = state_data.get("categories", [])
     matching = [
         category for category in categories
         if category.get("availStatus") == "1" and category.get("range")
     ]
+
+    if preferred_rows:
+        if not layout_snapshot:
+            return False, "Row data unavailable on this poll"
+
+        matches = [
+            seat for seat in layout_snapshot.get("available_seats", [])
+            if seat.get("row") in preferred_rows
+            and (
+                not preferred_categories
+                or seat.get("section_code", "").upper() in preferred_categories
+            )
+        ]
+
+        if matches:
+            return True, f"Selected rows open: {_summarize_matches(matches)} ({state_data.get('showTime', '?')})"
+
+        row_text = ", ".join(preferred_rows)
+        if preferred_categories:
+            labels = [
+                category.get("label") or category.get("code")
+                for category in categories
+                if category.get("code", "").upper() in preferred_categories
+            ]
+            section_text = ", ".join(labels or preferred_categories)
+            return False, f"Rows {row_text} still unavailable in {section_text} ({state_data.get('showTime', '?')})"
+
+        return False, f"Rows {row_text} still unavailable ({state_data.get('showTime', '?')})"
 
     if preferred_categories:
         matching = [category for category in matching if category.get("code", "").upper() in preferred_categories]
