@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BookMyShow Seat Alert</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet" />
+  <style>
+    :root { --bms-red: #dc3545; --bms-dark: #1a1a2e; --bms-card: #16213e; --bms-accent: #e94560; }
+    body { background: var(--bms-dark); color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+    .card { background: var(--bms-card); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    .btn-primary { background: var(--bms-accent); transition: all 0.2s; }
+    .btn-primary:hover { background: #c73e54; transform: translateY(-1px); box-shadow: 0 4px 15px rgba(233,69,96,0.4); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+    .input-field { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1); color: #fff; border-radius: 10px; padding: 12px 16px; width: 100%; transition: border 0.2s; }
+    .input-field:focus { outline: none; border-color: var(--bms-accent); background: rgba(255,255,255,0.1); }
+    .input-field::placeholder { color: rgba(255,255,255,0.35); }
+    .step { display: none; animation: fadeIn 0.3s ease; }
+    .step.active { display: block; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .movie-card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px 18px; cursor: pointer; transition: all 0.2s; }
+    .movie-card:hover, .movie-card.selected { border-color: var(--bms-accent); background: rgba(233,69,96,0.1); }
+    .theatre-card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .showtime-chip { display: inline-block; padding: 8px 16px; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; margin: 4px; cursor: pointer; transition: all 0.2s; font-size: 14px; }
+    .showtime-chip:hover, .showtime-chip.selected { border-color: var(--bms-accent); background: rgba(233,69,96,0.15); color: #fff; }
+    .row-chip { display: inline-block; width: 44px; height: 44px; line-height: 44px; text-align: center; border: 1px solid rgba(255,255,255,0.15); border-radius: 10px; margin: 4px; cursor: pointer; transition: all 0.2s; font-weight: 600; }
+    .row-chip:hover, .row-chip.selected { border-color: var(--bms-accent); background: var(--bms-accent); color: #fff; }
+    .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 20px; font-weight: 600; font-size: 14px; }
+    .status-monitoring { background: rgba(251,191,36,0.15); color: #fbbf24; }
+    .status-found { background: rgba(52,211,153,0.15); color: #34d399; }
+    .status-stopped { background: rgba(239,68,68,0.15); color: #ef4444; }
+    .log-entry { font-family: 'Fira Code', monospace, monospace; font-size: 13px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .breadcrumb { display: flex; gap: 8px; align-items: center; font-size: 13px; color: rgba(255,255,255,0.4); margin-bottom: 24px; }
+    .breadcrumb .active-crumb { color: var(--bms-accent); font-weight: 600; }
+    .breadcrumb .done-crumb { color: rgba(255,255,255,0.6); }
+    .spinner { border: 3px solid rgba(255,255,255,0.1); border-top: 3px solid var(--bms-accent); border-radius: 50%; width: 20px; height: 20px; animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .dropdown-item { padding: 12px 16px; cursor: pointer; transition: background 0.15s; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 2px; }
+    .dropdown-item:last-child { border-bottom: none; }
+    .dropdown-item:hover, .dropdown-item.focused { background: rgba(233,69,96,0.15); }
+    .dropdown-item .movie-title { font-weight: 600; font-size: 14px; color: #fff; }
+    .dropdown-item .movie-meta { font-size: 12px; color: rgba(255,255,255,0.4); }
+    .selected-movie-chip { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: rgba(233,69,96,0.12); border: 1px solid rgba(233,69,96,0.4); border-radius: 10px; margin-bottom: 4px; }
+    .selected-movie-chip .title { font-weight: 600; font-size: 14px; }
+    .selected-movie-chip .clear { color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; line-height: 1; }
+    select.input-field { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23999' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; }
+  </style>
+</head>
+<body>
+  <div class="max-w-xl mx-auto px-4 py-8">
+
+    <!-- Header -->
+    <div class="text-center mb-8">
+      <h1 class="text-3xl font-bold mb-2">🎬 Seat Alert</h1>
+      <p class="text-sm" style="color: rgba(255,255,255,0.45);">Get notified the moment seats open on BookMyShow</p>
+    </div>
+
+    <!-- Breadcrumbs -->
+    <div class="breadcrumb" id="breadcrumbs">
+      <span id="bc-1" class="active-crumb">Movie</span>
+      <span>→</span>
+      <span id="bc-2">Showtime</span>
+      <span>→</span>
+      <span id="bc-3">Preferences</span>
+      <span>→</span>
+      <span id="bc-4">Monitor</span>
+    </div>
+
+    <!-- ══════════════ STEP 1: City + Movie ══════════════ -->
+    <div class="card p-6 step active" id="step1">
+      <h2 class="text-lg font-semibold mb-4">Select city & movie</h2>
+
+      <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">City</label>
+      <select id="citySelect" class="input-field mb-4">
+        <option value="">Loading cities...</option>
+      </select>
+
+      <!-- Search mode (default) -->
+      <div id="searchModeDiv">
+        <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">Search movie</label>
+        <div class="relative mb-1" id="movieSearchWrapper">
+          <input type="text" id="movieSearch" class="input-field" placeholder="Type movie name..." autocomplete="off" />
+          <span id="searchSpinner" style="display:none; position:absolute; right:14px; top:50%; transform:translateY(-50%);"><span class="spinner" style="width:16px;height:16px;border-width:2px;"></span></span>
+          <div id="movieDropdown" style="display:none; position:absolute; top:calc(100% + 6px); left:0; right:0; z-index:100; background:#1e2a45; border:1px solid rgba(233,69,96,0.3); border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden; max-height:280px; overflow-y:auto;"></div>
+        </div>
+        <p id="movieHint" class="text-xs mb-3" style="color: rgba(255,255,255,0.3);">Loading movies...</p>
+        <div id="movieResults" class="mb-4"></div>
+      </div>
+
+      <!-- URL fallback mode (shown when API fails) -->
+      <div id="urlModeDiv" style="display:none;">
+        <div class="p-3 rounded-xl mb-3" style="background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.2);">
+          <p class="text-xs" style="color:#fbbf24;">⚠️ Movie search unavailable — paste the BookMyShow URL directly instead.</p>
+        </div>
+        <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">BookMyShow show URL</label>
+        <input type="url" id="bmsUrlInput" class="input-field mb-1" placeholder="https://in.bookmyshow.com/buytickets/..." autocomplete="off" />
+        <p class="text-xs mb-3" style="color: rgba(255,255,255,0.3);">Open BookMyShow → find your show → copy the URL from the address bar</p>
+        <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">Movie name <span class="text-xs">(for your notification)</span></label>
+        <input type="text" id="manualMovieName" class="input-field mb-4" placeholder="e.g. Dhurandhar" />
+        <div id="urlModeResults" class="mb-4"></div>
+      </div>
+
+      <button id="step1Next" class="btn-primary text-white font-semibold py-3 px-6 rounded-xl w-full" disabled>
+        Next — Select Showtime →
+      </button>
+    </div>
+
+    <!-- ══════════════ STEP 2: Theatre + Showtime ══════════════ -->
+    <div class="card p-6 step" id="step2">
+      <button onclick="goToStep(1)" class="text-sm mb-4 inline-block" style="color: var(--bms-accent);">← Back to movie</button>
+      <h2 class="text-lg font-semibold mb-1">Select showtime</h2>
+      <p id="selectedMovieLabel" class="text-sm mb-4" style="color: rgba(255,255,255,0.5);"></p>
+
+      <div id="showtimeLoading" class="text-center py-8" style="display:none;">
+        <div class="spinner mx-auto mb-3"></div>
+        <p class="text-sm" style="color: rgba(255,255,255,0.4);">Fetching showtimes...</p>
+      </div>
+
+      <div id="theatreList" class="space-y-3 mb-4"></div>
+      <div id="noShowtimes" class="text-center py-8" style="display:none;">
+        <p class="text-sm" style="color: rgba(255,255,255,0.4);">No showtimes found for today. Try a different movie or check later.</p>
+      </div>
+
+      <button id="step2Next" class="btn-primary text-white font-semibold py-3 px-6 rounded-xl w-full" disabled>
+        Next — Set Preferences →
+      </button>
+    </div>
+
+    <!-- ══════════════ STEP 3: Row + Seats + Phone ══════════════ -->
+    <div class="card p-6 step" id="step3">
+      <button onclick="goToStep(2)" class="text-sm mb-4 inline-block" style="color: var(--bms-accent);">← Back to showtimes</button>
+      <h2 class="text-lg font-semibold mb-4">Preferences & notification</h2>
+
+      <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">Preferred row</label>
+      <div id="rowPicker" class="flex flex-wrap mb-4">
+        <!-- Rows A-P -->
+      </div>
+
+      <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">Specific seats <span class="text-xs">(optional — e.g. A1, A2, A3)</span></label>
+      <input type="text" id="seatInput" class="input-field mb-4" placeholder="Leave blank for any seat in the row" />
+
+      <label class="block text-sm mb-2" style="color: rgba(255,255,255,0.5);">WhatsApp number</label>
+      <div class="flex gap-2 mb-6">
+        <span class="input-field" style="width: 60px; text-align: center; flex-shrink: 0;">+91</span>
+        <input type="tel" id="phoneInput" class="input-field" placeholder="98765 43210" maxlength="10" />
+      </div>
+
+      <button id="notifyBtn" class="btn-primary text-white font-bold py-4 px-6 rounded-xl w-full text-lg" disabled>
+        🔔 Notify Me
+      </button>
+    </div>
+
+    <!-- ══════════════ STEP 4: Status ══════════════ -->
+    <div class="card p-6 step" id="step4">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold">Monitoring</h2>
+        <span id="statusBadge" class="status-badge status-monitoring">
+          <span class="pulse">●</span> Starting...
+        </span>
+      </div>
+
+      <div id="monitorSummary" class="p-4 rounded-xl mb-4" style="background: rgba(255,255,255,0.03);">
+        <!-- Filled dynamically -->
+      </div>
+
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-sm font-semibold">Live log</span>
+        <span id="pollCount" class="text-xs" style="color: rgba(255,255,255,0.4);"></span>
+      </div>
+      <div id="logFeed" class="p-4 rounded-xl overflow-y-auto" style="background: rgba(0,0,0,0.3); max-height: 300px; min-height: 150px;">
+        <p class="log-entry" style="color: rgba(255,255,255,0.3);">Waiting for first poll...</p>
+      </div>
+
+      <button id="stopBtn" class="mt-4 py-3 px-6 rounded-xl w-full font-semibold" style="background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3);" onclick="stopMonitor()">
+        ⏹ Stop Monitoring
+      </button>
+    </div>
+
+  </div>
+
+  <!-- ══════════════ JAVASCRIPT ══════════════ -->
+  <script>
+    // ── State ─────────────────────────────────────────────────────────────────
+    let state = {
+      city: '',
+      movie: null,       // { id, title, slug, ... }
+      theatre: null,     // { name, code }
+      showtime: null,    // { id, time, screen, booking_url }
+      row: '',
+      seats: '',
+      phone: '',
+      monitorId: null,
+    };
+
+    let statusPollTimer = null;
+
+    // ── Cities (hardcoded — no API call needed) ───────────────────────────────
+    const CITIES = [
+      {code:'CHEN',name:'Chennai'},{code:'MUMBAI',name:'Mumbai'},
+      {code:'BANG',name:'Bengaluru'},{code:'HYDB',name:'Hyderabad'},
+      {code:'NCR',name:'Delhi-NCR'},{code:'KOLK',name:'Kolkata'},
+      {code:'PUNE',name:'Pune'},{code:'AHMD',name:'Ahmedabad'},
+      {code:'KOCH',name:'Kochi'},{code:'COIMB',name:'Coimbatore'},
+      {code:'JAIPR',name:'Jaipur'},{code:'LUCK',name:'Lucknow'},
+      {code:'CHND',name:'Chandigarh'},{code:'VIZAG',name:'Visakhapatnam'},
+      {code:'MADU',name:'Madurai'},{code:'TRICH',name:'Trichy'},
+      {code:'INDO',name:'Indore'},{code:'NAGP',name:'Nagpur'},
+      {code:'VADO',name:'Vadodara'},{code:'SURT',name:'Surat'},
+    ];
+
+    // ── All movies cache (loaded when city is picked) ─────────────────────────
+    let allMovies = [];
+    let moviesLoading = false;
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    document.addEventListener('DOMContentLoaded', () => {
+      populateCities();
+      buildRowPicker();
+      setupListeners();
+      loadMoviesForCity(state.city); // preload default city
+    });
+
+    function populateCities() {
+      const sel = document.getElementById('citySelect');
+      sel.innerHTML = CITIES.map(c =>
+        `<option value="${c.code}" ${c.code === 'CHEN' ? 'selected' : ''}>${c.name}</option>`
+      ).join('');
+      state.city = sel.value;
+    }
+
+    async function loadMoviesForCity(cityCode) {
+      if (moviesLoading) return;
+      moviesLoading = true;
+      allMovies = [];
+      document.getElementById('searchSpinner').style.display = 'inline';
+      document.getElementById('movieHint').textContent = 'Loading movies for this city...';
+      try {
+        const resp = await fetch(`/api/movies?city=${cityCode}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        allMovies = await resp.json();
+        document.getElementById('movieHint').textContent =
+          allMovies.length > 0
+            ? `${allMovies.length} movies ready — type to search`
+            : 'No movies found. Try another city.';
+        // Make sure search mode is shown
+        document.getElementById('searchModeDiv').style.display = 'block';
+        document.getElementById('urlModeDiv').style.display = 'none';
+      } catch (e) {
+        console.error('Failed to load movies', e);
+        // Switch to URL paste fallback
+        document.getElementById('searchModeDiv').style.display = 'none';
+        document.getElementById('urlModeDiv').style.display = 'block';
+      } finally {
+        moviesLoading = false;
+        document.getElementById('searchSpinner').style.display = 'none';
+        const q = document.getElementById('movieSearch').value.trim();
+        if (q.length >= 2) filterMovies(q);
+      }
+    }
+
+    // ── Movie Search (local filtering — no extra API call) ────────────────────
+    let searchTimeout = null;
+    function setupListeners() {
+      document.getElementById('citySelect').addEventListener('change', e => {
+        state.city = e.target.value;
+        state.movie = null;
+        allMovies = [];
+        document.getElementById('movieResults').innerHTML = '';
+        document.getElementById('movieSearch').value = '';
+        closeDropdown();
+        updateStep1Btn();
+        loadMoviesForCity(state.city);
+      });
+
+      document.getElementById('movieSearch').addEventListener('input', e => {
+        const q = e.target.value.trim();
+        clearTimeout(searchTimeout);
+        if (q.length < 2) {
+          closeDropdown();
+          if (!moviesLoading && !state.movie) {
+            document.getElementById('movieHint').textContent =
+              allMovies.length > 0
+                ? `${allMovies.length} movies ready — type to search`
+                : 'Type at least 2 characters to search';
+          }
+          return;
+        }
+        searchTimeout = setTimeout(() => filterMovies(q), 180);
+      });
+
+      document.getElementById('movieSearch').addEventListener('focus', e => {
+        const q = e.target.value.trim();
+        if (q.length >= 2) filterMovies(q);
+      });
+
+      // Close dropdown on outside click
+      document.addEventListener('click', e => {
+        if (!document.getElementById('movieSearchWrapper').contains(e.target)) {
+          closeDropdown();
+        }
+      });
+
+      document.getElementById('step1Next').addEventListener('click', () => {
+        // If URL mode — skip showtime step, go straight to preferences
+        const isUrlMode = document.getElementById('urlModeDiv').style.display !== 'none';
+        goToStep(isUrlMode ? 3 : 2);
+      });
+      document.getElementById('step2Next').addEventListener('click', () => goToStep(3));
+
+      document.getElementById('phoneInput').addEventListener('input', updateNotifyBtn);
+      document.getElementById('notifyBtn').addEventListener('click', startMonitoring);
+
+      // URL mode inputs
+      document.getElementById('bmsUrlInput').addEventListener('input', handleUrlModeInput);
+      document.getElementById('manualMovieName').addEventListener('input', handleUrlModeInput);
+    }
+
+    function filterMovies(query) {
+      const q = query.toLowerCase();
+      const dropdown = document.getElementById('movieDropdown');
+
+      if (moviesLoading) {
+        dropdown.style.display = 'block';
+        dropdown.innerHTML = '<div class="dropdown-item"><span class="movie-meta">Loading movies, please wait...</span></div>';
+        return;
+      }
+
+      const matches = allMovies.filter(m => m.title.toLowerCase().includes(q));
+
+      if (matches.length === 0) {
+        dropdown.style.display = 'block';
+        dropdown.innerHTML = '<div class="dropdown-item"><span class="movie-meta">No movies found — try a different spelling</span></div>';
+        document.getElementById('movieHint').textContent = '';
+        return;
+      }
+
+      document.getElementById('movieHint').textContent = '';
+      dropdown.style.display = 'block';
+      dropdown.innerHTML = matches.slice(0, 8).map((m, i) => `
+        <div class="dropdown-item" data-idx="${i}" onclick='selectMovie(${JSON.stringify(m).replace(/'/g, "&#39;")})'>
+          <span class="movie-title">${highlightMatch(m.title, query)}</span>
+          ${m.language ? `<span class="movie-meta">${m.language}${m.genre ? ' · ' + m.genre : ''}</span>` : ''}
+        </div>
+      `).join('');
+    }
+
+    function highlightMatch(title, query) {
+      const idx = title.toLowerCase().indexOf(query.toLowerCase());
+      if (idx === -1) return title;
+      return title.slice(0, idx)
+        + `<span style="color: var(--bms-accent);">${title.slice(idx, idx + query.length)}</span>`
+        + title.slice(idx + query.length);
+    }
+
+    function closeDropdown() {
+      document.getElementById('movieDropdown').style.display = 'none';
+    }
+
+    function selectMovie(movie) {
+      state.movie = movie;
+      // Show selected movie as a chip, clear the search input
+      document.getElementById('movieSearch').value = '';
+      document.getElementById('movieHint').textContent = '';
+      closeDropdown();
+      document.getElementById('movieResults').innerHTML = `
+        <div class="selected-movie-chip">
+          <div>
+            <div class="title">🎬 ${movie.title}</div>
+            ${movie.language ? `<div style="font-size:12px;color:rgba(255,255,255,0.4);margin-top:2px;">${movie.language}</div>` : ''}
+          </div>
+          <span class="clear" onclick="clearMovie()" title="Change movie">✕</span>
+        </div>
+      `;
+      updateStep1Btn();
+    }
+
+    function clearMovie() {
+      state.movie = null;
+      document.getElementById('movieResults').innerHTML = '';
+      document.getElementById('movieSearch').value = '';
+      document.getElementById('movieSearch').focus();
+      document.getElementById('movieHint').textContent =
+        allMovies.length > 0 ? `${allMovies.length} movies ready — type to search` : '';
+      updateStep1Btn();
+    }
+
+    function handleUrlModeInput() {
+      const url = document.getElementById('bmsUrlInput').value.trim();
+      const name = document.getElementById('manualMovieName').value.trim();
+      if (url.startsWith('http') && name) {
+        state.movie = { id: '', title: name, slug: url, language: '', genre: '' };
+        state.showtime = { id: '', time: '', screen: '', booking_url: url };
+        state.theatre = { name: 'From URL', code: '' };
+        document.getElementById('urlModeResults').innerHTML = `
+          <div class="selected-movie-chip">
+            <div><div class="title">🎬 ${name}</div>
+            <div style="font-size:11px;color:rgba(255,255,255,0.3);margin-top:2px;word-break:break-all;">${url.slice(0,60)}...</div></div>
+          </div>`;
+      } else {
+        state.movie = null;
+        state.showtime = null;
+        state.theatre = null;
+        document.getElementById('urlModeResults').innerHTML = '';
+      }
+      updateStep1Btn();
+    }
+
+    function updateStep1Btn() {
+      document.getElementById('step1Next').disabled = !state.movie;
+    }
+
+    // ── Showtimes ─────────────────────────────────────────────────────────────
+    async function loadShowtimes() {
+      document.getElementById('showtimeLoading').style.display = 'block';
+      document.getElementById('theatreList').innerHTML = '';
+      document.getElementById('noShowtimes').style.display = 'none';
+      state.theatre = null;
+      state.showtime = null;
+      updateStep2Btn();
+
+      try {
+        const resp = await fetch(`/api/showtimes?city=${state.city}&movie_id=${state.movie.id}`);
+        const theatres = await resp.json();
+        document.getElementById('showtimeLoading').style.display = 'none';
+
+        if (theatres.length === 0) {
+          document.getElementById('noShowtimes').style.display = 'block';
+          return;
+        }
+
+        document.getElementById('theatreList').innerHTML = theatres.map(t => `
+          <div class="theatre-card">
+            <div class="font-semibold text-sm mb-1">${t.name}</div>
+            ${t.address ? `<div class="text-xs mb-2" style="color: rgba(255,255,255,0.35);">${t.address}</div>` : ''}
+            <div class="flex flex-wrap">
+              ${t.shows.map(s => `
+                <span class="showtime-chip"
+                      onclick='selectShowtime(${JSON.stringify({theatre: {name: t.name, code: t.code}, show: s}).replace(/'/g, "&#39;")})'
+                      data-show-id="${s.id}">
+                  ${s.time}
+                  ${s.screen ? `<span class="text-xs opacity-50 ml-1">${s.screen}</span>` : ''}
+                </span>
+              `).join('')}
+            </div>
+          </div>
+        `).join('');
+      } catch (e) {
+        document.getElementById('showtimeLoading').style.display = 'none';
+        document.getElementById('noShowtimes').style.display = 'block';
+      }
+    }
+
+    function selectShowtime(data) {
+      state.theatre = data.theatre;
+      state.showtime = data.show;
+      document.querySelectorAll('.showtime-chip').forEach(c => c.classList.remove('selected'));
+      document.querySelector(`[data-show-id="${data.show.id}"]`).classList.add('selected');
+      updateStep2Btn();
+    }
+
+    function updateStep2Btn() {
+      document.getElementById('step2Next').disabled = !state.showtime;
+    }
+
+    // ── Row Picker ────────────────────────────────────────────────────────────
+    function buildRowPicker() {
+      const rows = 'A B C D E F G H I J K L M N O P'.split(' ');
+      document.getElementById('rowPicker').innerHTML = rows.map(r =>
+        `<span class="row-chip" onclick="selectRow('${r}')" data-row="${r}">${r}</span>`
+      ).join('');
+    }
+
+    function selectRow(row) {
+      state.row = row;
+      document.querySelectorAll('.row-chip').forEach(c => c.classList.remove('selected'));
+      document.querySelector(`[data-row="${row}"]`).classList.add('selected');
+      updateNotifyBtn();
+    }
+
+    function updateNotifyBtn() {
+      const phone = document.getElementById('phoneInput').value.replace(/\s/g, '');
+      state.phone = phone;
+      document.getElementById('notifyBtn').disabled = !(phone.length >= 10 && state.row);
+    }
+
+    // ── Step Navigation ───────────────────────────────────────────────────────
+    function goToStep(n) {
+      document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+      document.getElementById(`step${n}`).classList.add('active');
+
+      // Update breadcrumbs
+      for (let i = 1; i <= 4; i++) {
+        const bc = document.getElementById(`bc-${i}`);
+        bc.className = i < n ? 'done-crumb' : i === n ? 'active-crumb' : '';
+      }
+
+      // Trigger data loading
+      if (n === 2) {
+        document.getElementById('selectedMovieLabel').textContent = state.movie.title;
+        loadShowtimes();
+      }
+    }
+
+    // ── Start Monitoring ──────────────────────────────────────────────────────
+    async function startMonitoring() {
+      const btn = document.getElementById('notifyBtn');
+      btn.disabled = true;
+      btn.textContent = 'Starting...';
+
+      state.seats = document.getElementById('seatInput').value.trim();
+
+      try {
+        const resp = await fetch('/api/monitor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            city: state.city,
+            movie: state.movie.title,
+            theatre: state.theatre.name,
+            showtime: state.showtime.time,
+            show_id: state.movie.id,
+            booking_url: state.showtime.booking_url || '',
+            preferred_row: state.row,
+            preferred_seats: state.seats,
+            phone: '+91' + state.phone,
+            poll_interval: 8,
+          }),
+        });
+        const data = await resp.json();
+        state.monitorId = data.monitor_id;
+
+        // Show summary
+        document.getElementById('monitorSummary').innerHTML = `
+          <div class="text-sm space-y-1">
+            <div>🎥 <strong>${state.movie.title}</strong></div>
+            <div>🏠 ${state.theatre.name} — ${state.showtime.time}</div>
+            <div>💺 Row ${state.row}${state.seats ? ' — Seats ' + state.seats : ''}</div>
+            <div>📱 +91 ${state.phone}</div>
+          </div>
+        `;
+
+        goToStep(4);
+        startStatusPolling();
+
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = '🔔 Notify Me';
+        alert('Failed to start monitoring. Please try again.');
+      }
+    }
+
+    // ── Status Polling ────────────────────────────────────────────────────────
+    function startStatusPolling() {
+      statusPollTimer = setInterval(fetchStatus, 3000);
+      fetchStatus(); // immediate first fetch
+    }
+
+    async function fetchStatus() {
+      if (!state.monitorId) return;
+      try {
+        const resp = await fetch(`/api/monitor/${state.monitorId}`);
+        const data = await resp.json();
+
+        // Update badge
+        const badge = document.getElementById('statusBadge');
+        if (data.status === 'monitoring') {
+          badge.className = 'status-badge status-monitoring';
+          badge.innerHTML = '<span class="pulse">●</span> Monitoring...';
+        } else if (data.status === 'seats_found') {
+          badge.className = 'status-badge status-found';
+          badge.innerHTML = '● Seats Found!';
+          clearInterval(statusPollTimer);
+          document.getElementById('stopBtn').style.display = 'none';
+        } else if (data.status === 'stopped') {
+          badge.className = 'status-badge status-stopped';
+          badge.innerHTML = '● Stopped';
+          clearInterval(statusPollTimer);
+        }
+
+        // Update poll count
+        document.getElementById('pollCount').textContent =
+          data.poll_count > 0 ? `Poll #${data.poll_count} • Last: ${data.last_checked || '—'}` : '';
+
+        // Update logs
+        if (data.logs && data.logs.length > 0) {
+          const feed = document.getElementById('logFeed');
+          feed.innerHTML = data.logs.map(l =>
+            `<div class="log-entry"><span style="color: rgba(255,255,255,0.3); margin-right: 8px;">${l.time}</span>${l.message}</div>`
+          ).join('');
+          feed.scrollTop = feed.scrollHeight;
+        }
+
+      } catch (e) {
+        console.error('Status fetch failed', e);
+      }
+    }
+
+    async function stopMonitor() {
+      if (!state.monitorId) return;
+      try {
+        await fetch(`/api/monitor/${state.monitorId}/stop`, { method: 'POST' });
+        clearInterval(statusPollTimer);
+        fetchStatus();
+      } catch (e) {
+        console.error('Stop failed', e);
+      }
+    }
+  </script>
+</body>
+</html>
