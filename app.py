@@ -473,11 +473,15 @@ def _check_rows(page, preferred_rows: str) -> tuple:
     """
     Robust seat detection for BookMyShow.
 
+    Works for both open shows AND sold-out shows (watches for cancellations).
+
     Strategy:
-    1. Detect if show is sold out
-    2. Try row-based detection (best case)
-    3. If row detection fails → fallback to seat presence
-    4. Always prefer "alert > miss"
+    1. Count all seat elements — if < 10, page hasn't loaded yet
+    2. Count AVAILABLE seats (no sold/booked/blocked class)
+    3. If no row preference → alert when any available seat exists
+    4. Try row-level DOM detection for specific rows
+    5. Fallback: if row detection fails but available seats > 0 → alert
+    6. Never alert when 0 available seats (even if sold-out text is absent)
     """
 
     try:
@@ -485,40 +489,50 @@ def _check_rows(page, preferred_rows: str) -> tuple:
     except Exception:
         return False, "Page not ready"
 
-    # ─────────────────────────────────────────────
-    # 1. SOLD OUT CHECK (fast exit)
-    # ─────────────────────────────────────────────
-    if any(p in page_text for p in ["sold out", "housefull", "no seats available"]):
-        return False, "Show is sold out"
-
     # Normalize preferred rows
     rows_list = [r.strip().upper() for r in preferred_rows.split(",") if r.strip()]
 
     # ─────────────────────────────────────────────
-    # 2. COLLECT ALL SEATS (base signal)
+    # 1. COLLECT ALL SEATS
     # ─────────────────────────────────────────────
     try:
-        seats = page.query_selector_all(
+        all_seats = page.query_selector_all(
             '[class*="seat"], [class*="Seat"], [class*="__seat"], [class*="_seat"]'
         )
     except Exception:
-        seats = []
+        all_seats = []
 
-    seat_count = len(seats)
-    log.info("[seat-scan] Total seats found: %d", seat_count)
+    seat_count = len(all_seats)
+    log.info("[seat-scan] Total seat elements: %d", seat_count)
 
-    # If no seats → seat map not loaded yet
     if seat_count < 10:
-        return False, "Seat map not loaded yet"
+        # Page not loaded / seats not rendered yet
+        if any(p in page_text for p in ["sold out", "housefull", "no seats available"]):
+            return False, "Show appears sold out — watching for cancellations"
+        return False, "Seat map not loaded yet — waiting"
 
     # ─────────────────────────────────────────────
-    # 3. IF NO ROW PREFERENCE → SUCCESS
+    # 2. COUNT AVAILABLE SEATS
+    # ─────────────────────────────────────────────
+    _booked_keywords = ["sold", "booked", "unavail", "disabled", "blocked", "locked"]
+    available_count = 0
+    for s in all_seats:
+        cls = (s.get_attribute("class") or "").lower()
+        if not any(w in cls for w in _booked_keywords):
+            available_count += 1
+
+    log.info("[seat-scan] Available: %d / %d seats", available_count, seat_count)
+
+    # ─────────────────────────────────────────────
+    # 3. NO ROW PREFERENCE → alert if ANY seat open
     # ─────────────────────────────────────────────
     if not rows_list:
-        return True, f"Seat map open ({seat_count} seats detected)"
+        if available_count > 0:
+            return True, f"Seats available! ({available_count} of {seat_count} open)"
+        return False, f"Seat map visible ({seat_count} seats, all booked) — watching for cancellations"
 
     # ─────────────────────────────────────────────
-    # 4. TRY ROW-LEVEL DETECTION (best effort)
+    # 4. ROW-LEVEL DETECTION (best effort via JS)
     # ─────────────────────────────────────────────
     try:
         result = page.evaluate("""
@@ -533,30 +547,46 @@ def _check_rows(page, preferred_rows: str) -> tuple:
                 return r.width > 4 && r.width < 80 && r.height > 4 && r.height < 80;
             });
 
-            debug.push(`seats:${seatEls.length}`);
+            debug.push(`visible_seats:${seatEls.length}`);
 
             for (const seat of seatEls) {
                 const cls = (seat.className || '').toLowerCase();
-                const isAvailable = !cls.includes('unavailable') && !cls.includes('blocked');
+                const isAvailable =
+                    !cls.includes('sold')     &&
+                    !cls.includes('booked')   &&
+                    !cls.includes('unavail')  &&
+                    !cls.includes('disabled') &&
+                    !cls.includes('blocked')  &&
+                    !cls.includes('locked');
 
                 if (!isAvailable) continue;
 
                 let node = seat;
                 let rowLabel = null;
 
-                // Walk up DOM to find row label
-                for (let i = 0; i < 5 && node; i++) {
+                // Walk up DOM (max 6 levels) to find a row label sibling/ancestor text
+                for (let i = 0; i < 6 && node; i++) {
                     node = node.parentElement;
                     if (!node) break;
 
-                    const text = (node.innerText || '').trim();
-
-                    // Match A, B, AA, etc
-                    const match = text.match(/\\b[A-Z]{1,2}\\b/);
-                    if (match) {
-                        rowLabel = match[0];
+                    // Check innerText of this container — if it's short and looks like A/AA it's the row label
+                    const directText = (node.innerText || '').split('\\n')[0].trim();
+                    const clean = directText.replace(/[^A-Za-z]/g, '').toUpperCase();
+                    if (/^[A-Z]{1,2}$/.test(clean) && directText.length <= 4) {
+                        rowLabel = clean;
                         break;
                     }
+
+                    // Also check for a label child element
+                    for (const child of node.children) {
+                        const raw = (child.innerText || child.textContent || '').trim();
+                        const c2  = raw.replace(/[^A-Za-z]/g, '').toUpperCase();
+                        if (/^[A-Z]{1,2}$/.test(c2) && raw.length <= 4) {
+                            rowLabel = c2;
+                            break;
+                        }
+                    }
+                    if (rowLabel) break;
                 }
 
                 if (rowLabel) {
@@ -564,39 +594,43 @@ def _check_rows(page, preferred_rows: str) -> tuple:
                 }
             }
 
+            debug.push(`rows_mapped:${Object.keys(rowsFound).join(',') || 'none'}`);
             return { rowsFound, debug };
         }
         """, rows_list)
 
         rows_found = result.get("rowsFound", {})
-        debug_info = result.get("debug", [])
-        for d in debug_info:
+        for d in result.get("debug", []):
             log.info("[seat-scan] %s", d)
-        log.info("[seat-scan] Rows detected: %s", rows_found)
+        log.info("[seat-scan] Row map: %s", rows_found)
 
-        # Match preferred rows
+        # Matched preferred rows
         for row in rows_list:
             if row in rows_found and rows_found[row] > 0:
                 return True, f"Row {row} available ({rows_found[row]} seats)"
 
-        # Row detection ran but didn't match preferred rows
+        # Row mapping worked but preferred rows have no available seats
         if rows_found:
-            return False, f"No seats in preferred rows {preferred_rows}. Rows found: {list(rows_found.keys())}"
+            return False, (
+                f"No available seats in rows {preferred_rows} yet "
+                f"(found rows: {','.join(rows_found.keys())} · "
+                f"{available_count}/{seat_count} total available)"
+            )
 
     except Exception as e:
         log.warning("[seat-scan] Row detection failed: %s — using fallback", e)
 
     # ─────────────────────────────────────────────
-    # 5. CRITICAL FALLBACK (most important)
+    # 5. FALLBACK: row detection failed/mapped nothing
+    #    Only alert if actual available seats exist
     # ─────────────────────────────────────────────
-    # If seats exist → ALERT (better false positive than miss)
-    if seat_count > 20:
-        return True, f"Seats detected (fallback) — {seat_count} seats visible"
+    if available_count > 0:
+        return True, f"Seats available (fallback) — {available_count} of {seat_count} open"
 
     # ─────────────────────────────────────────────
-    # 6. FINAL FAILURE
+    # 6. NOTHING AVAILABLE
     # ─────────────────────────────────────────────
-    return False, f"No available seats detected (checked {seat_count} seats)"
+    return False, f"No available seats yet ({seat_count} seats, all booked)"
 
 
 def _send_alert(monitor_id, booking_url):
