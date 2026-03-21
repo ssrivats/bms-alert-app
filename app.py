@@ -89,6 +89,11 @@ def status_page(monitor_id):
     return render_template("status.html", monitor_id=monitor_id)
 
 
+@app.route("/dashboard")
+def dashboard_page():
+    return render_template("dashboard.html")
+
+
 @app.route("/api/cities")
 def get_cities():
     return jsonify(CITIES)
@@ -283,11 +288,19 @@ def start_monitor():
         "theatre": data.get("theatre", ""),
         "showtime": data.get("showtime", ""),
         "show_id": data.get("show_id", ""),
+        "event_code": data.get("event_code", ""),
+        "venue_code": data.get("venue_code", ""),
+        "date": data.get("date", ""),
         "booking_url": data.get("booking_url", ""),
+        # New: zone preference replaces raw row letters
+        # Values: 'best' | 'back' | 'mid' | 'nfront'
+        "zone_pref": data.get("zone_pref", "best"),
+        # Legacy row support kept for popup backward compat
         "preferred_row": data.get("preferred_row", "").upper(),
-        "preferred_seats": data.get("preferred_seats", ""),
         "phone": data.get("phone", ""),
-        "poll_interval": int(data.get("poll_interval", 8)),
+        "poll_interval": int(data.get("poll_interval", 15)),
+        # 'sniper' = single precise show, 'planner' = multi-show
+        "mode": data.get("mode", "sniper"),
     }
 
     monitors[monitor_id] = {
@@ -335,6 +348,29 @@ def get_monitor_status(monitor_id):
         },
         "logs": monitor["logs"][-20:],  # Last 20 log entries
     })
+
+
+@app.route("/api/monitors")
+def list_monitors():
+    """List all monitors (active, stopped, found)."""
+    result = []
+    for mid, m in monitors.items():
+        result.append({
+            "id": mid,
+            "status": m["status"],
+            "started_at": m["started_at"],
+            "poll_count": m["poll_count"],
+            "last_checked": m["last_checked"],
+            "last_result": m["last_result"],
+            "alert_sent": m["alert_sent"],
+            "movie": m["config"].get("movie", ""),
+            "phone": m["config"].get("phone", ""),
+            "zone_pref": m["config"].get("zone_pref", "best"),
+            "booking_url": m["config"].get("booking_url", ""),
+        })
+    # Most recent first
+    result.sort(key=lambda x: x["started_at"], reverse=True)
+    return jsonify(result)
 
 
 @app.route("/api/monitor/<monitor_id>/stop", methods=["POST"])
@@ -422,71 +458,230 @@ def _run_monitor(monitor_id):
 
 
 def _detect_seats(page, config) -> tuple:
-    """Detect if booking is open and preferred seats are available."""
+    """
+    Detect if preferred seats are available.
+    Uses zone_pref (best/back/mid/nfront) to evaluate the seat map.
+    Falls back to legacy row-letter check if zone_pref is absent.
+    """
     page_text = page.inner_text("body").lower()
 
-    # Not yet open signals
+    # ── Not yet open ──────────────────────────────────────────
     not_open = ["coming soon", "notify me", "booking opens", "advance booking"]
     for phrase in not_open:
         if phrase in page_text:
             return False, f"Not open yet ('{phrase}')"
 
-    # Sold out signals
+    # ── Fully sold out ────────────────────────────────────────
     sold_out = ["sold out", "housefull", "no seats available"]
     for phrase in sold_out:
         if phrase in page_text:
             return False, f"Sold out ('{phrase}')"
 
-    # Booking open signals
-    selectors = [
-        "a[href*='buytickets']",
-        "button.book-tickets-btn",
-        "[class*='bookTickets']",
-        "[data-testid='book-tickets']",
-        "a.btnBook",
-        "button:has-text('Book')",
-    ]
+    # ── Parse seat map sections ───────────────────────────────
+    zone_pref = config.get("zone_pref", "best")
+    seat_info = _parse_seat_sections(page)
 
-    for selector in selectors:
+    if seat_info["has_map"]:
+        available_in_zone = _check_zone(seat_info, zone_pref)
+        section_name = seat_info.get("sections", [{}])[0].get("name", "top section")
+        if available_in_zone:
+            label = _zone_label(zone_pref)
+            return True, f"{label} available in {section_name} ({available_in_zone} open)"
+        else:
+            return False, f"No {_zone_label(zone_pref).lower()} seats in {section_name} yet"
+
+    # ── Legacy: row-letter fallback ───────────────────────────
+    pref_row = config.get("preferred_row", "")
+    if pref_row:
+        if f"row {pref_row.lower()}" in page_text:
+            return True, f"Row {pref_row} seats detected!"
+        return False, f"Row {pref_row} not available yet"
+
+    # ── Generic booking-open check ────────────────────────────
+    book_selectors = [
+        "a[href*='buytickets']", "button.book-tickets-btn",
+        "[class*='bookTickets']", "[data-testid='book-tickets']",
+        "a.btnBook",
+    ]
+    for selector in book_selectors:
         try:
             el = page.query_selector(selector)
             if el and el.is_visible():
-                # Check for preferred row
-                pref_row = config.get("preferred_row", "")
-                if pref_row:
-                    # Try to find seat map with the row
-                    if f"row {pref_row.lower()}" in page_text or f'"{pref_row.lower()}"' in page_text:
-                        return True, f"Row {pref_row} seats detected!"
-
-                    # Check for specific seats
-                    pref_seats = config.get("preferred_seats", "")
-                    if pref_seats:
-                        seats = [s.strip().lower() for s in pref_seats.split(",")]
-                        found = [s for s in seats if s in page_text]
-                        if found:
-                            return True, f"Seats found: {', '.join(found)}"
-
-                    # Booking open but row not confirmed
-                    return True, f"Booking open (Row {pref_row} not confirmed — check manually)"
-
                 return True, "Booking is open!"
         except Exception:
             pass
 
-    # Check if there are any clickable show buttons
-    try:
-        links = page.query_selector_all("a, button")
-        for link in links:
-            try:
-                text = link.inner_text().lower().strip()
-                if text in ("book", "book now", "book tickets") and link.is_visible():
-                    return True, f"Book button found: '{text}'"
-            except Exception:
-                pass
-    except Exception:
-        pass
+    return False, "No available seats detected"
 
-    return False, "No booking signals yet"
+
+def _parse_seat_sections(page) -> dict:
+    """
+    Parse the BMS seat layout DOM into sections grouped by price tier.
+    Sections are sorted by vertical position (topmost = most premium on BMS).
+    Returns: { has_map, screenAtTop, sections: [{name, rows: [{label, available, yPos}]}] }
+    """
+    try:
+        return page.evaluate("""
+        () => {
+            // ── Detect screen position ────────────────────────────────
+            const screenEl = Array.from(document.querySelectorAll('*')).find(el => {
+                const txt = el.textContent.trim().toUpperCase();
+                return txt.length < 20
+                    && el.children.length === 0
+                    && (txt === 'SCREEN' || txt.startsWith('SCREEN'));
+            });
+            const screenAtTop = screenEl
+                ? screenEl.getBoundingClientRect().top < window.innerHeight / 2
+                : true;
+
+            // ── Find section header elements ──────────────────────────
+            // BMS renders section headers with price like "₹183.80 ELITE"
+            const headerEls = Array.from(document.querySelectorAll(
+                '[class*="category"], [class*="Category"], ' +
+                '[class*="price-band"], [class*="PriceBand"], ' +
+                '[class*="section-title"], [class*="SectionTitle"], ' +
+                '[class*="tier"], [class*="Tier"]'
+            )).filter(el => {
+                const txt = el.textContent.trim();
+                // Must have some text and look like a section label
+                return txt.length > 1 && txt.length < 60 && el.children.length < 4;
+            });
+
+            // ── Gather all seat rows ──────────────────────────────────
+            const allRows = Array.from(document.querySelectorAll(
+                '[class*="seat-row"], [class*="SeatRow"], [class*="row"]'
+            )).filter(el =>
+                el.querySelectorAll('[class*="seat"], [class*="Seat"]').length > 2
+            );
+
+            if (allRows.length === 0) {
+                // Fallback: count raw seats with no row grouping
+                const seats = document.querySelectorAll('[class*="seat"], [class*="Seat"]');
+                const sold = Array.from(seats).filter(s =>
+                    /sold|unavail|booked/i.test(s.className)
+                ).length;
+                return {
+                    has_map: seats.length > 0,
+                    screenAtTop,
+                    sections: [{
+                        name: 'All seats',
+                        rows: [],
+                        total: seats.length,
+                        available: seats.length - sold,
+                    }]
+                };
+            }
+
+            // ── Build rows with yPos ──────────────────────────────────
+            const rowData = allRows.map(rowEl => {
+                const seats = rowEl.querySelectorAll('[class*="seat"], [class*="Seat"]');
+                const sold = Array.from(seats).filter(s =>
+                    /sold|unavail|booked/i.test(s.className)
+                ).length;
+                const labelEl = rowEl.querySelector('[class*="label"], [class*="Label"]');
+                return {
+                    label: labelEl ? labelEl.textContent.trim() : '',
+                    total: seats.length,
+                    available: seats.length - sold,
+                    yPos: rowEl.getBoundingClientRect().top,
+                };
+            });
+
+            // ── Group rows into sections ──────────────────────────────
+            // For each row, find the nearest header above it (by yPos)
+            const headerData = headerEls.map(el => ({
+                name: el.textContent.trim(),
+                yPos: el.getBoundingClientRect().top,
+            })).sort((a, b) => a.yPos - b.yPos);
+
+            const sections = [];
+
+            if (headerData.length === 0) {
+                // No headers found — treat all rows as one section
+                sections.push({ name: 'Section', rows: rowData });
+            } else {
+                // Assign each row to the nearest header above it
+                headerData.forEach((hdr, i) => {
+                    const nextHdrY = headerData[i + 1]?.yPos ?? Infinity;
+                    const rows = rowData.filter(r => r.yPos >= hdr.yPos && r.yPos < nextHdrY);
+                    if (rows.length > 0) {
+                        sections.push({ name: hdr.name, rows });
+                    }
+                });
+
+                // Any rows above all headers → prepend as first section
+                const orphanRows = rowData.filter(r => r.yPos < headerData[0].yPos);
+                if (orphanRows.length > 0) {
+                    sections.unshift({ name: 'Top section', rows: orphanRows });
+                }
+            }
+
+            // Sort sections top-to-bottom (topmost = most premium on BMS)
+            sections.sort((a, b) => {
+                const aY = a.rows[0]?.yPos ?? 0;
+                const bY = b.rows[0]?.yPos ?? 0;
+                return aY - bY;
+            });
+
+            return { has_map: true, screenAtTop, sections };
+        }
+        """)
+    except Exception as e:
+        log.warning("Seat map parse failed: %s", e)
+        return {"has_map": False, "screenAtTop": True, "sections": []}
+
+
+def _check_zone(seat_info: dict, zone_pref: str) -> int:
+    """
+    Two modes:
+      'best' → any available seat in the top section
+      'back' → only back rows of the top section (last third, farthest from screen)
+
+    Only looks at the FIRST (topmost/most premium) section.
+    """
+    sections = seat_info.get("sections", [])
+
+    if not sections:
+        return 0
+
+    # Always work only on the top section
+    top_section = sections[0]
+    rows = top_section.get("rows", [])
+    section_name = top_section.get("name", "top section")
+
+    # No row data in this section — use total available if present
+    if not rows:
+        return top_section.get("available", 0)
+
+    # Sort rows by vertical position
+    sorted_rows = sorted(rows, key=lambda r: r["yPos"])
+    n = len(sorted_rows)
+
+    if zone_pref != "back":
+        # 'best' → any seat in the top section
+        total_avail = sum(r["available"] for r in sorted_rows)
+        log.info("[%s] best mode — %d seats available", section_name, total_avail)
+        return total_avail
+
+    # 'back' → last rows of the top section (farthest from screen)
+    screen_at_top = seat_info.get("screenAtTop", True)
+
+    if screen_at_top:
+        # Screen at top → back rows are at the bottom of the section (high yPos)
+        back_rows = sorted_rows[-(max(1, n // 3)):]
+    else:
+        # Screen at bottom → back rows are at the top of the section (low yPos)
+        back_rows = sorted_rows[:max(1, n // 3)]
+
+    available_in_back = sum(r["available"] for r in back_rows)
+    back_labels = [r["label"] for r in back_rows if r["label"]]
+    log.info("[%s] back rows %s — %d available", section_name, back_labels, available_in_back)
+
+    return available_in_back
+
+
+def _zone_label(zone_pref: str) -> str:
+    return "Back row" if zone_pref == "back" else "Best available"
 
 
 def _send_alert(monitor_id, show_url):
@@ -501,20 +696,22 @@ def _send_alert(monitor_id, show_url):
     if not phone.startswith("whatsapp:+"):
         phone = phone.replace("whatsapp:", "whatsapp:+91")
 
-    message = (
-        f"🎬 *Seats Available!*\n\n"
-        f"🎥 {config['movie']}\n"
-        f"🏠 {config['theatre']}\n"
-        f"🕐 {config['showtime']}\n"
-    )
-    if config.get("preferred_row"):
-        message += f"💺 Row {config['preferred_row']}"
-        if config.get("preferred_seats"):
-            message += f" — Seats {config['preferred_seats']}"
-        message += "\n"
+    zone_label = _zone_label(config.get("zone_pref", "best"))
+    last_result = monitor.get("last_result", "")
 
-    message += f"\n👉 Book now: {show_url}\n"
-    message += f"\n_Detected at {datetime.now().strftime('%I:%M:%S %p')}_"
+    message = (
+        f"🚨 *Seats just opened!*\n\n"
+        f"🎬 {config['movie']}\n"
+    )
+    if config.get("theatre"):
+        message += f"🏠 {config['theatre']}\n"
+    if config.get("showtime"):
+        message += f"🕐 {config['showtime']}\n"
+    if last_result:
+        message += f"💺 {last_result}\n"
+
+    message += f"\n👉 *Book now before they're gone:*\n{show_url}\n"
+    message += f"\n_Alert sent at {datetime.now().strftime('%I:%M %p')}_"
 
     try:
         if TWILIO_SID and TWILIO_TOKEN:

@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BMS Alert — Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: #e94560;
+      padding: 18px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .header h1 { font-size: 18px; font-weight: 700; color: #fff; }
+    .header p  { font-size: 12px; color: rgba(255,255,255,0.7); margin-top: 2px; }
+    .refresh-badge {
+      background: rgba(255,255,255,0.15);
+      border-radius: 20px;
+      padding: 6px 14px;
+      font-size: 12px;
+      color: #fff;
+      cursor: pointer;
+      border: none;
+      transition: background 0.2s;
+    }
+    .refresh-badge:hover { background: rgba(255,255,255,0.25); }
+
+    /* ── Container ── */
+    .container { max-width: 900px; margin: 0 auto; padding: 28px 20px; }
+
+    /* ── Summary bar ── */
+    .summary {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+    .stat-card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 14px 20px;
+      flex: 1;
+      min-width: 120px;
+    }
+    .stat-card .label { font-size: 11px; color: rgba(255,255,255,0.35); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-card .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+    .stat-card.active  .value { color: #fbbf24; }
+    .stat-card.found   .value { color: #34d399; }
+    .stat-card.stopped .value { color: #ef4444; }
+    .stat-card.total   .value { color: #e0e0e0; }
+
+    /* ── Kill all button ── */
+    .top-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 16px;
+    }
+    .btn-kill-all {
+      background: rgba(239,68,68,0.12);
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 10px;
+      color: #ef4444;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 9px 18px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-kill-all:hover { background: rgba(239,68,68,0.22); }
+    .btn-kill-all:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    /* ── Empty state ── */
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: rgba(255,255,255,0.3);
+    }
+    .empty .icon { font-size: 48px; margin-bottom: 14px; }
+    .empty p { font-size: 14px; }
+
+    /* ── Monitor card ── */
+    .card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-bottom: 12px;
+      position: relative;
+    }
+    .card.active  { border-left: 3px solid #fbbf24; }
+    .card.seats_found { border-left: 3px solid #34d399; background: rgba(52,211,153,0.04); }
+    .card.stopped { border-left: 3px solid #ef4444; opacity: 0.65; }
+
+    .card-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .card-title { font-size: 15px; font-weight: 600; flex: 1; }
+    .card-title a {
+      color: #e0e0e0;
+      text-decoration: none;
+    }
+    .card-title a:hover { color: #e94560; }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .chip-active   { background: rgba(251,191,36,0.12); color: #fbbf24; }
+    .chip-found    { background: rgba(52,211,153,0.12);  color: #34d399; }
+    .chip-stopped  { background: rgba(239,68,68,0.12);   color: #ef4444; }
+    .chip-starting { background: rgba(148,163,184,0.12); color: #94a3b8; }
+
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
+    .dot-active  { background: #fbbf24; animation: pulse 1.5s infinite; }
+    .dot-found   { background: #34d399; }
+    .dot-stopped { background: #ef4444; }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+
+    .card-meta {
+      display: flex;
+      gap: 16px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .meta-item { font-size: 12px; color: rgba(255,255,255,0.4); }
+    .meta-item span { color: rgba(255,255,255,0.75); }
+
+    .card-result {
+      margin-top: 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.45);
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 8px 12px;
+      line-height: 1.5;
+    }
+    .card-result .result-label { color: rgba(255,255,255,0.25); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    .card-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .btn-stop {
+      background: rgba(239,68,68,0.1);
+      border: 1px solid rgba(239,68,68,0.25);
+      border-radius: 8px;
+      color: #ef4444;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 14px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-stop:hover { background: rgba(239,68,68,0.2); }
+    .btn-stop:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .btn-log {
+      color: #e94560;
+      font-size: 12px;
+      text-decoration: none;
+      padding: 7px 14px;
+      border: 1px solid rgba(233,69,96,0.25);
+      border-radius: 8px;
+      transition: background 0.15s;
+    }
+    .btn-log:hover { background: rgba(233,69,96,0.08); }
+
+    .btn-book {
+      background: rgba(52,211,153,0.1);
+      border: 1px solid rgba(52,211,153,0.25);
+      border-radius: 8px;
+      color: #34d399;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 14px;
+      text-decoration: none;
+      transition: background 0.15s;
+    }
+    .btn-book:hover { background: rgba(52,211,153,0.2); }
+
+    /* ── Footer ── */
+    .footer {
+      text-align: center;
+      padding: 24px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.15);
+    }
+    .auto-refresh-note { margin-top: 4px; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #1e1e30;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 10px;
+      padding: 12px 20px;
+      font-size: 13px;
+      color: #e0e0e0;
+      transition: transform 0.3s ease;
+      z-index: 100;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div>
+      <h1>🎬 BMS Alert Dashboard</h1>
+      <p>All active and recent monitors</p>
+    </div>
+    <button class="refresh-badge" onclick="load()">↻ Refresh</button>
+  </div>
+
+  <div class="container">
+
+    <div class="summary">
+      <div class="stat-card active">
+        <div class="label">Watching</div>
+        <div class="value" id="cntActive">—</div>
+      </div>
+      <div class="stat-card found">
+        <div class="label">Seats found</div>
+        <div class="value" id="cntFound">—</div>
+      </div>
+      <div class="stat-card stopped">
+        <div class="label">Stopped</div>
+        <div class="value" id="cntStopped">—</div>
+      </div>
+      <div class="stat-card total">
+        <div class="label">Total</div>
+        <div class="value" id="cntTotal">—</div>
+      </div>
+    </div>
+
+    <div class="top-actions">
+      <button class="btn-kill-all" id="killAllBtn" onclick="killAll()" disabled>
+        🛑 Stop all active
+      </button>
+    </div>
+
+    <div id="listContainer">
+      <div class="empty"><div class="icon">📡</div><p>Loading monitors…</p></div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    BMS Seat Alert &nbsp;·&nbsp; Railway cloud backend
+    <div class="auto-refresh-note" id="refreshNote"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let allMonitors = [];
+    let autoTimer;
+
+    // ── Load & render ─────────────────────────────────────────────────────────
+    async function load() {
+      try {
+        const resp = await fetch('/api/monitors');
+        allMonitors = await resp.json();
+      } catch (e) {
+        showToast('⚠️ Could not reach server');
+        return;
+      }
+      render(allMonitors);
+      scheduleNext();
+    }
+
+    function render(monitors) {
+      const active  = monitors.filter(m => m.status === 'monitoring' || m.status === 'starting');
+      const found   = monitors.filter(m => m.status === 'seats_found');
+      const stopped = monitors.filter(m => m.status === 'stopped');
+
+      document.getElementById('cntActive').textContent  = active.length;
+      document.getElementById('cntFound').textContent   = found.length;
+      document.getElementById('cntStopped').textContent = stopped.length;
+      document.getElementById('cntTotal').textContent   = monitors.length;
+
+      document.getElementById('killAllBtn').disabled = active.length === 0;
+
+      const container = document.getElementById('listContainer');
+      if (monitors.length === 0) {
+        container.innerHTML = `<div class="empty"><div class="icon">📡</div><p>No monitors yet. Start one from the extension.</p></div>`;
+        return;
+      }
+
+      container.innerHTML = monitors.map(m => cardHTML(m)).join('');
+    }
+
+    function cardHTML(m) {
+      const isActive  = m.status === 'monitoring' || m.status === 'starting';
+      const isFound   = m.status === 'seats_found';
+      const isStopped = m.status === 'stopped';
+
+      const chipClass = isActive ? 'chip-active' : isFound ? 'chip-found' : isStopped ? 'chip-stopped' : 'chip-starting';
+      const dotClass  = isActive ? 'dot-active'  : isFound ? 'dot-found'  : 'dot-stopped';
+      const label     = isActive ? 'Watching' : isFound ? 'Seats found!' : isStopped ? 'Stopped' : 'Starting…';
+
+      const startedAgo = m.started_at ? timeAgo(m.started_at) : '—';
+      const zone = m.zone_pref === 'back' ? 'Back rows only' : 'Best available';
+      const phone = m.phone ? m.phone.replace('+91', '') : '—';
+
+      const movieLink = m.booking_url
+        ? `<a href="${m.booking_url}" target="_blank">${esc(m.movie || 'Unknown show')}</a>`
+        : esc(m.movie || 'Unknown show');
+
+      const logLink = `<a class="btn-log" href="/status/${m.id}" target="_blank">View log ↗</a>`;
+
+      const bookBtn = isFound && m.booking_url
+        ? `<a class="btn-book" href="${m.booking_url}" target="_blank">📲 Book now</a>`
+        : '';
+
+      const stopBtn = isActive
+        ? `<button class="btn-stop" onclick="stop('${m.id}', this)">🛑 Stop</button>`
+        : '';
+
+      const resultBlock = m.last_result
+        ? `<div class="card-result">
+             <div class="result-label">Last check · ${m.last_checked || ''} · Poll #${m.poll_count}</div>
+             ${esc(m.last_result)}
+           </div>`
+        : '';
+
+      return `
+        <div class="card ${m.status === 'monitoring' ? 'active' : m.status}" id="card-${m.id}">
+          <div class="card-top">
+            <div class="card-title">${movieLink}</div>
+            <span class="status-chip ${chipClass}">
+              <span class="dot ${dotClass}"></span>${label}
+            </span>
+          </div>
+          <div class="card-meta">
+            <div class="meta-item">WhatsApp <span>${esc(phone)}</span></div>
+            <div class="meta-item">Preference <span>${zone}</span></div>
+            <div class="meta-item">Started <span>${startedAgo}</span></div>
+            <div class="meta-item">ID <span style="font-family:monospace;font-size:11px">${m.id}</span></div>
+          </div>
+          ${resultBlock}
+          <div class="card-actions">
+            ${stopBtn}${logLink}${bookBtn}
+          </div>
+        </div>`;
+    }
+
+    // ── Stop one ──────────────────────────────────────────────────────────────
+    async function stop(id, btn) {
+      btn.disabled = true;
+      btn.textContent = 'Stopping…';
+      try {
+        await fetch(`/api/monitor/${id}/stop`, { method: 'POST' });
+        showToast('✅ Monitor stopped');
+        await load();
+      } catch (e) {
+        showToast('⚠️ Could not stop monitor');
+        btn.disabled = false;
+        btn.textContent = '🛑 Stop';
+      }
+    }
+
+    // ── Stop all active ───────────────────────────────────────────────────────
+    async function killAll() {
+      const active = allMonitors.filter(m => m.status === 'monitoring' || m.status === 'starting');
+      document.getElementById('killAllBtn').disabled = true;
+      document.getElementById('killAllBtn').textContent = 'Stopping…';
+      await Promise.all(
+        active.map(m => fetch(`/api/monitor/${m.id}/stop`, { method: 'POST' }).catch(() => {}))
+      );
+      showToast(`✅ Stopped ${active.length} monitor${active.length !== 1 ? 's' : ''}`);
+      await load();
+      document.getElementById('killAllBtn').textContent = '🛑 Stop all active';
+    }
+
+    // ── Auto-refresh every 8 s ────────────────────────────────────────────────
+    function scheduleNext() {
+      clearTimeout(autoTimer);
+      let secs = 8;
+      const note = document.getElementById('refreshNote');
+      const tick = () => {
+        note.textContent = `Auto-refreshing in ${secs}s`;
+        if (secs-- > 0) { autoTimer = setTimeout(tick, 1000); }
+        else { load(); }
+      };
+      tick();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function esc(str) {
+      return String(str)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;');
+    }
+
+    function timeAgo(iso) {
+      const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+      if (diff < 60)  return `${diff}s ago`;
+      if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+      return `${Math.floor(diff/3600)}h ago`;
+    }
+
+    let toastTimer;
+    function showToast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+    }
+
+    // ── Boot ──────────────────────────────────────────────────────────────────
+    load();
+  </script>
+</body>
+</html>
