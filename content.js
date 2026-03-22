@@ -178,18 +178,31 @@ function parseListingInfo() {
       : `https://in.bookmyshow.com${href}`;
 
     // ── Per-theatre container detection ──────────────────────────────────────
-    // Walk UP ancestors until we reach an element that wraps EXACTLY this one
-    // cinema link (not any other cinema link).  That's the theatre card.
+    // Phase 1: walk UP to the first ancestor that wraps ONLY this cinema link.
     let container = link.parentElement;
     for (let depth = 0; depth < 15 && container && container !== document.body; depth++) {
-      const linksInside = container.querySelectorAll(
+      const n = container.querySelectorAll(
         'a[href*="/cinemas/"][href*="/buytickets/"]'
-      );
-      if (linksInside.length === 1) break;   // found the single-theatre wrapper
+      ).length;
+      if (n === 1) break;   // isolated to this theatre
       container = container.parentElement;
     }
-    // Safety: if we walked all the way up without isolating, fall back to link's parent
     if (!container || container === document.body) container = link.parentElement;
+
+    // Phase 2: if this container has no visible time-like text yet, walk UP a
+    // few more levels while the parent still wraps only this one cinema link.
+    // This handles layouts where the showtime row lives in a sibling element
+    // one level above the link wrapper.
+    for (let grow = 0; grow < 4; grow++) {
+      const parent = container.parentElement;
+      if (!parent || parent === document.body) break;
+      if (/\d{1,2}:\d{2}\s*(AM|PM)/i.test(container.textContent)) break; // already has times
+      const parentLinkCount = parent.querySelectorAll(
+        'a[href*="/cinemas/"][href*="/buytickets/"]'
+      ).length;
+      if (parentLinkCount !== 1) break;  // parent spans multiple theatres — stop
+      container = parent;
+    }
 
     const containerDesc = container
       ? `${container.tagName}.${String(container.className).replace(/\s+/g, '.').slice(0, 50)}`
@@ -254,10 +267,19 @@ function parseListingInfo() {
     }
 
     // ── Showtimes — only from within this theatre's container ───────────────
+    // Do NOT require children.length === 0 — showtimes can live inside nested
+    // spans or buttons (e.g. <button><span>10:15 PM</span></button>).
+    // Deduplicate by text so nested wrappers don't produce duplicate entries.
+    const seenTimes = new Set();
     const showtimes = Array.from(container.querySelectorAll('*'))
-      .filter(el => el.children.length === 0 && timePattern.test(el.textContent))
-      .map(el => el.textContent.trim())
-      .filter(Boolean);
+      .reduce((acc, el) => {
+        const t = el.textContent.trim();
+        if (timePattern.test(t) && !seenTimes.has(t)) {
+          seenTimes.add(t);
+          acc.push(t);
+        }
+        return acc;
+      }, []);
 
     console.log(`[BMS]   link[${idx}] name="${name}" showtimes=${JSON.stringify(showtimes)}`);
 
@@ -288,28 +310,42 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     const pageType = detectPageType();
 
     if (pageType === 'listing') {
-      // Retry up to 2 times if the first parse finds no showtimes —
-      // BMS React pages sometimes finish hydrating a moment after DOMContentLoaded.
-      const MAX_ATTEMPTS = 2;
-      const RETRY_DELAY_MS = 500 + Math.floor(Math.random() * 300); // 500-800 ms
+      // Always do exactly 2 parses (~700 ms apart) and return whichever is better.
+      // "Better" = more theatres with ≥1 showtime, then more total theatres,
+      // then more total showtimes.  This handles partial hydration and catches
+      // theatres that only appear after React finishes rendering.
 
-      const tryParse = (attempt) => {
-        const info = parseListingInfo();
-        const usable = info.theatres.some(t => t.showtimes.length > 0);
-        console.log(
-          `[BMS] listing parse attempt ${attempt}/${MAX_ATTEMPTS}: ` +
-          `${info.theatres.length} theatre(s), usable=${usable}`
-        );
-
-        if (!usable && attempt < MAX_ATTEMPTS) {
-          console.log(`[BMS] retrying parseListingInfo in ${RETRY_DELAY_MS}ms…`);
-          setTimeout(() => tryParse(attempt + 1), RETRY_DELAY_MS);
-        } else {
-          sendResponse({ listing: usable ? info : null });
-        }
+      const scoreInfo = (info) => {
+        const withShowtimes = info.theatres.filter(t => t.showtimes.length > 0).length;
+        const totalShowtimes = info.theatres.reduce((n, t) => n + t.showtimes.length, 0);
+        return [withShowtimes, info.theatres.length, totalShowtimes];
       };
 
-      tryParse(1);
+      const isBetter = (candidate, current) => {
+        const sc = scoreInfo(candidate);
+        const sr = scoreInfo(current);
+        for (let i = 0; i < sc.length; i++) {
+          if (sc[i] !== sr[i]) return sc[i] > sr[i];
+        }
+        return false;
+      };
+
+      const logScore = (label, info) => {
+        const [w, t, s] = scoreInfo(info);
+        console.log(`[BMS] listing parse ${label}: ${t} theatre(s), ${w} with showtimes, ${s} total showtimes`);
+      };
+
+      const first = parseListingInfo();
+      logScore('1/2', first);
+
+      setTimeout(() => {
+        const second = parseListingInfo();
+        logScore('2/2', second);
+        const best = isBetter(second, first) ? second : first;
+        const usable = best.theatres.some(t => t.showtimes.length > 0);
+        console.log(`[BMS] using ${isBetter(second, first) ? 'second' : 'first'} result, usable=${usable}`);
+        sendResponse({ listing: usable ? best : null });
+      }, 700);
 
     } else {
       const show = parseShowInfo();
