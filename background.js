@@ -158,18 +158,19 @@ function checkRowsInSeatLayout(seatLayoutData, preferredRows) {
 
   function resolveAvailable(seat) {
     const nested = seat.seat || {};
-    // Try status fields in priority order
     const st =
-      seat.seatStatus  !== undefined ? seat.seatStatus  :
+      seat.seatStatus !== undefined ? seat.seatStatus :
       nested.seatStatus !== undefined ? nested.seatStatus :
-      seat.status      !== undefined ? seat.status      :
+      seat.status !== undefined ? seat.status :
+      nested.status !== undefined ? nested.status :
       seat.availStatus !== undefined ? seat.availStatus :
       nested.availStatus !== undefined ? nested.availStatus :
       undefined;
-
-    // If no status field at all, cannot confirm unavailable — treat as available
-    if (st === undefined) return true;
-    return !UNAVAILABLE.has(st);
+    // Missing status means we cannot confirm availability.
+    // Do NOT treat unknown as available, or we'll trigger false alerts.
+    if (st === undefined || st === null || st === '') return false;
+    const normalized = typeof st === 'string' ? st.trim().toUpperCase() : st;
+    return !UNAVAILABLE.has(normalized);
   }
 
   // Collect up to 5 sample seats for debug logging (emitted only on miss)
