@@ -1,597 +1,322 @@
-// ── BMS Seat Alert — Content Script (Sniper Mode) ─────────────────────────────
-// Injected into every in.bookmyshow.com page.
-// On seat-layout pages: reads show info, injects the Sniper widget.
-// On other BMS pages: stays invisible, answers GET_PAGE_INFO from popup.
+// ── BMS Seat Alert — Content Script ──────────────────────────────────────────
+// Works on two page types:
+//   1. /movies/{city}/seat-layout/{ec}/{vc}/{sid}/{date}  — seat map page
+//   2. /movies/{city}/{slug}/buytickets/{ec}/{date}       — movie listing page
 
-const SERVER_URL = "https://bms-alert-app-production.up.railway.app";
-const WIDGET_ID  = "bms-seat-alert-widget";
+// ── Page type detection ───────────────────────────────────────────────────────
+function detectPageType() {
+  const path = window.location.pathname;
+  if (/\/seat-layout\//.test(path)) return 'seat-layout';
+  // Movie-level listing: /movies/{city}/{slug}/buytickets/{eventCode}/{date}
+  // Note: cinema-specific pages are /cinemas/... — user won't land there directly
+  if (/\/movies\/[^/]+\/[^/]+\/buytickets\//.test(path)) return 'listing';
+  return 'other';
+}
 
-// ── Parse show info from current URL + DOM ─────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  SEAT-LAYOUT PAGE — parse the specific session being viewed
+// ══════════════════════════════════════════════════════════════════════════════
+
 function parseShowInfo() {
-  // URL format: /movies/{city}/seat-layout/{eventCode}/{venueCode}/{showId}/{date}
-  const m = window.location.pathname.match(
-    /\/seat-layout\/([^/]+)\/([^/]+)\/([^/]+)\/(\d{8})/
+  const info = {
+    bookingUrl: window.location.href,
+    eventCode:  '',
+    venueCode:  '',
+    showId:     '',
+    date:       '',
+    movie:      '',
+    venue:      '',
+    showtime:   '',
+  };
+
+  // ── 1. URL parsing ─────────────────────────────────────────────────────────
+  const urlMatch = window.location.pathname.match(
+    /\/seat-layout\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)/
   );
-  if (!m) return null;
-
-  const [, eventCode, venueCode, showId, date] = m;
-
-  // Human-readable info from DOM
-  const movieName = _readMovieName();
-  const venueName = _readVenueName();
-  const showtime  = _readShowtime();
-
-  // Format date for display: 20260321 → 21 Mar 2026
-  const d = date;
-  const dateStr = `${d.slice(6,8)} ${['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][parseInt(d.slice(4,6))]} ${d.slice(0,4)}`;
-
-  return { eventCode, venueCode, showId, date, movieName, venueName, showtime, dateStr };
-}
-
-function _readMovieName() {
-  // BMS title: "Youth - Book Tickets Online | BookMyShow" or page H1/H2
-  const selectors = ['h1', 'h2', '[class*="movie-title"]', '[class*="movieTitle"]'];
-  for (const sel of selectors) {
-    const el = document.querySelector(sel);
-    if (el?.textContent?.trim()) return el.textContent.trim().split(/[-|]/)[0].trim();
+  if (urlMatch) {
+    info.eventCode = urlMatch[1];
+    info.venueCode = urlMatch[2];
+    info.showId    = urlMatch[3];
+    info.date      = urlMatch[4];
   }
-  return document.title.replace(/[-|].*/, '').replace(/BookMyShow/i, '').trim() || 'This show';
-}
-
-function _readVenueName() {
-  // BMS shows venue in breadcrumb / header detail line
-  const selectors = [
-    '[class*="venue"]', '[class*="Venue"]',
-    '[class*="theatre"]', '[class*="Theatre"]',
-    '[class*="cinema"]', '[class*="Cinema"]',
-  ];
-  for (const sel of selectors) {
-    const el = document.querySelector(sel);
-    if (el?.textContent?.trim().length > 2) return el.textContent.trim();
-  }
-  // Fallback: read from the detail bar text
-  const detail = document.querySelector('[class*="detail"], [class*="Detail"], [class*="info"]');
-  if (detail) {
-    const text = detail.textContent.trim();
-    const parts = text.split(/\|/);
-    if (parts.length > 0) return parts[0].trim();
-  }
-  return '';
-}
-
-function _readShowtime() {
-  // Active showtime button (highlighted) or from detail bar
-  const activeTime = document.querySelector(
-    '[class*="showtime"][class*="active"], [class*="ShowTime"][class*="active"], ' +
-    '[class*="time-slot"][class*="active"], button[class*="active"][class*="show"]'
-  );
-  if (activeTime?.textContent?.trim()) return activeTime.textContent.trim();
-
-  // Try reading from the detail/subheader bar
-  const detail = document.querySelector('[class*="detail"], [class*="Detail"]');
-  if (detail) {
-    const text = detail.textContent;
-    const timeMatch = text.match(/\d{1,2}:\d{2}\s*(AM|PM)/i);
-    if (timeMatch) return timeMatch[0];
-  }
-  return '';
-}
-
-// ── Detect if current show is sold out ────────────────────────────────────────
-function detectSoldOut() {
-  const body = document.body.innerText.toLowerCase();
-
-  // Strong sold-out signals
-  const soldPhrases = ['sold out', 'housefull', 'no seats available', 'sold-out'];
-  for (const p of soldPhrases) {
-    if (body.includes(p)) return { soldOut: true, reason: p };
+  if (!info.date) {
+    const dm = window.location.pathname.match(/\/(\d{8})(?:\/|$)/);
+    if (dm) info.date = dm[1];
   }
 
-  // Check if seat map has NO available seats (all grey/sold)
-  const allSeats   = document.querySelectorAll('[class*="seat"], [class*="Seat"]').length;
-  const soldSeats  = document.querySelectorAll('[class*="sold"], [class*="Sold"], [class*="unavailable"]').length;
-  if (allSeats > 0 && soldSeats > 0 && soldSeats >= allSeats * 0.98) {
-    return { soldOut: true, reason: 'all seats sold' };
-  }
+  // ── 2. PRIMARY: window.__INITIAL_STATE__ ──────────────────────────────────
+  safeExtract(() => {
+    const sl = window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData;
+    if (!sl) return;
+    if (!info.movie && sl.eventName)               info.movie = sl.eventName;
+    if (!info.venue && sl.currentVenue?.VenueName) info.venue = sl.currentVenue.VenueName;
+    const shows = sl.currentVenue?.ShowTimes || [];
+    const thisShow = shows.find(s => String(s.SessionId) === info.showId)
+                  || sl.currentShowtime;
+    if (thisShow?.ShowTime && !info.showtime)       info.showtime = thisShow.ShowTime;
+  });
 
-  return { soldOut: false, reason: '' };
-}
-
-// ── Widget HTML ───────────────────────────────────────────────────────────────
-function buildWidgetHTML(show) {
-  return `
-<div id="${WIDGET_ID}" style="
-  position: fixed;
-  top: 80px;
-  right: 16px;
-  width: 224px;
-  z-index: 999999;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-">
-  <style>
-    #bsa-cta, #bsa-monitoring, #bsa-found { display: none; }
-    #bsa-cta.bsa-active, #bsa-monitoring.bsa-active, #bsa-found.bsa-active { display: block; }
-
-    .bsa-card {
-      background: #1a1a2e;
-      border-radius: 14px;
-      overflow: hidden;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.55);
-      border: 1px solid rgba(255,255,255,0.09);
-    }
-    .bsa-header {
-      background: linear-gradient(135deg, #7f1d1d, #dc2626);
-      padding: 11px 13px;
-      display: flex;
-      align-items: center;
-      gap: 7px;
-    }
-    .bsa-header-found {
-      background: linear-gradient(135deg, #14532d, #166534);
-    }
-    .bsa-header-dot {
-      width: 7px; height: 7px;
-      border-radius: 50%; background: rgba(255,255,255,0.8);
-      animation: bsa-blink 1.5s ease-in-out infinite;
-    }
-    @keyframes bsa-blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
-    .bsa-header-title {
-      color: #fff; font-size: 12px; font-weight: 800;
-    }
-    .bsa-body { padding: 12px 13px; }
-
-    .bsa-show-pill {
-      background: rgba(255,255,255,0.05);
-      border-left: 2px solid rgba(220,38,38,0.6);
-      border-radius: 0 7px 7px 0;
-      padding: 8px 10px;
-      margin-bottom: 10px;
-    }
-    .bsa-show-pill.bsa-green-border { border-left-color: #22c55e; }
-    .bsa-show-name   { color: rgba(255,255,255,0.85); font-size: 12px; font-weight: 600; }
-    .bsa-show-detail { color: rgba(255,255,255,0.35); font-size: 10px; margin-top: 2px; }
-
-    .bsa-prompt { color: rgba(255,255,255,0.4); font-size: 11px; text-align: center; margin-bottom: 10px; }
-
-    .bsa-btn-watch {
-      width: 100%; padding: 12px 8px;
-      background: linear-gradient(135deg, #dc2626, #ef4444);
-      border: none; border-radius: 9px;
-      color: #fff; font-size: 13px; font-weight: 800;
-      cursor: pointer; letter-spacing: -0.2px;
-      box-shadow: 0 5px 16px rgba(220,38,38,0.4);
-      transition: opacity 0.15s;
-    }
-    .bsa-btn-watch:hover { opacity: 0.88; }
-
-    .bsa-cust-toggle {
-      width: 100%; background: none; border: none;
-      color: rgba(255,255,255,0.25); font-size: 10px;
-      cursor: pointer; padding: 7px 0 0; text-align: center;
-      transition: color 0.15s;
-    }
-    .bsa-cust-toggle:hover { color: rgba(255,255,255,0.5); }
-
-    .bsa-cust-panel { display: none; padding-top: 8px; }
-    .bsa-cust-panel.bsa-open { display: block; }
-    .bsa-cust-label { color: rgba(255,255,255,0.25); font-size: 10px; margin-bottom: 6px; }
-    .bsa-pref-row { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
-    .bsa-back-row-wrap {
-      display: flex; align-items: flex-start; gap: 8px;
-      cursor: pointer; padding: 8px 0;
-    }
-    .bsa-back-row-wrap input[type="checkbox"] {
-      width: 15px; height: 15px; margin-top: 1px;
-      accent-color: #dc2626; cursor: pointer; flex-shrink: 0;
-    }
-    .bsa-back-row-label {
-      color: rgba(255,255,255,0.75); font-size: 12px; font-weight: 600;
-      display: block; line-height: 1.3;
-    }
-    .bsa-back-row-hint {
-      color: rgba(255,255,255,0.25); font-size: 10px;
-      display: block; margin-top: 1px;
-    }
-
-    .bsa-phone-wrap { display: flex; gap: 5px; align-items: center; }
-    .bsa-phone-pre {
-      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 6px; padding: 7px 8px;
-      color: rgba(255,255,255,0.4); font-size: 10px; white-space: nowrap;
-    }
-    .bsa-phone-input {
-      flex: 1; background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 6px; padding: 7px 8px;
-      color: #fff; font-size: 11px; outline: none;
-    }
-    .bsa-phone-input:focus { border-color: rgba(220,38,38,0.5); }
-    .bsa-phone-input::placeholder { color: rgba(255,255,255,0.2); }
-
-    .bsa-status-row {
-      display: flex; align-items: center; gap: 6px;
-      margin-bottom: 10px;
-    }
-    .bsa-status-dot {
-      width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
-      animation: bsa-blink 1.8s infinite; flex-shrink: 0;
-    }
-    .bsa-status-text { color: rgba(255,255,255,0.4); font-size: 11px; }
-
-    .bsa-btn-stop {
-      width: 100%; padding: 9px; border-radius: 8px;
-      border: 1px solid rgba(239,68,68,0.2);
-      background: rgba(239,68,68,0.06);
-      color: rgba(239,68,68,0.6); font-size: 11px; font-weight: 600;
-      cursor: pointer;
-    }
-    .bsa-btn-stop:hover { background: rgba(239,68,68,0.12); }
-
-    /* Found */
-    .bsa-found-emoji { font-size: 28px; text-align: center; margin-bottom: 6px; }
-    .bsa-found-title { color: #fff; font-size: 17px; font-weight: 800; text-align: center; margin-bottom: 3px; }
-    .bsa-found-where { color: rgba(255,255,255,0.6); font-size: 11px; text-align: center; margin-bottom: 10px; }
-    .bsa-btn-book {
-      width: 100%; padding: 13px; border-radius: 10px; border: none;
-      background: #22c55e; color: #fff; font-size: 13px; font-weight: 800;
-      cursor: pointer; box-shadow: 0 5px 16px rgba(34,197,94,0.4);
-    }
-    .bsa-btn-book:hover { opacity: 0.9; }
-    .bsa-btn-dismiss {
-      width: 100%; background: none; border: none;
-      color: rgba(255,255,255,0.2); font-size: 10px;
-      cursor: pointer; padding: 7px 0 0; text-align: center;
-    }
-
-    /* Minimise toggle */
-    .bsa-minimise {
-      position: absolute; top: 11px; right: 11px;
-      background: rgba(255,255,255,0.1); border: none;
-      border-radius: 50%; width: 18px; height: 18px;
-      color: rgba(255,255,255,0.5); font-size: 10px;
-      cursor: pointer; display: flex; align-items: center; justify-content: center;
-      line-height: 1;
-    }
-    .bsa-minimise:hover { background: rgba(255,255,255,0.2); }
-  </style>
-
-  <!-- State A: CTA -->
-  <div id="bsa-cta" class="bsa-card bsa-active">
-    <div class="bsa-header" style="position:relative;">
-      <div class="bsa-header-title">🎬 Seat Alert</div>
-      <button class="bsa-minimise" id="bsa-minimise-btn">−</button>
-    </div>
-    <div class="bsa-body">
-      <div class="bsa-show-pill">
-        <div class="bsa-show-name">${show.movieName || 'This show'}</div>
-        <div class="bsa-show-detail">${show.venueName ? show.venueName + ' · ' : ''}${show.showtime || ''}</div>
-      </div>
-      <div class="bsa-prompt">Seats sold out? I'll alert you the moment one opens.</div>
-      <button class="bsa-btn-watch" id="bsa-watch-btn">Watch this show →</button>
-      <button class="bsa-cust-toggle" id="bsa-cust-toggle">⚙ Customize ▾</button>
-      <div class="bsa-cust-panel" id="bsa-cust-panel">
-        <div class="bsa-cust-label">Seat preference</div>
-        <label class="bsa-back-row-wrap">
-          <input type="checkbox" id="bsa-back-only" />
-          <span class="bsa-back-row-label">Back rows only</span>
-          <span class="bsa-back-row-hint">Better view, may wait longer</span>
-        </label>
-        <div class="bsa-cust-label">WhatsApp</div>
-        <div class="bsa-phone-wrap">
-          <span class="bsa-phone-pre">🇮🇳 +91</span>
-          <input class="bsa-phone-input" id="bsa-phone" type="tel" placeholder="98765 43210" maxlength="10" />
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- State B: Monitoring -->
-  <div id="bsa-monitoring" class="bsa-card">
-    <div class="bsa-header">
-      <div class="bsa-header-dot"></div>
-      <div class="bsa-header-title">Watching this show</div>
-    </div>
-    <div class="bsa-body">
-      <div class="bsa-show-pill bsa-green-border">
-        <div class="bsa-show-name">${show.movieName || 'This show'}</div>
-        <div class="bsa-show-detail" id="bsa-mon-detail">${show.venueName ? show.venueName + ' · ' : ''}${show.showtime || ''}</div>
-      </div>
-      <div class="bsa-status-row">
-        <div class="bsa-status-dot"></div>
-        <div class="bsa-status-text" id="bsa-status-text">Checking for cancellations…</div>
-      </div>
-      <div class="bsa-status-row" style="margin-bottom:10px;">
-        <div style="width:6px;flex-shrink:0;"></div>
-        <div class="bsa-status-text" id="bsa-pref-text" style="color:rgba(255,255,255,0.2);">Preference: Best available</div>
-      </div>
-      <button class="bsa-btn-stop" id="bsa-stop-btn">Stop watching</button>
-    </div>
-  </div>
-
-  <!-- State C: Found -->
-  <div id="bsa-found" class="bsa-card">
-    <div class="bsa-header bsa-header-found">
-      <div class="bsa-header-title" style="width:100%;text-align:center;">🎉 Seats available!</div>
-    </div>
-    <div class="bsa-body">
-      <div class="bsa-found-where" id="bsa-found-where">${show.movieName} · ${show.showtime}</div>
-      <button class="bsa-btn-book" id="bsa-book-btn">Book now →</button>
-      <button class="bsa-btn-dismiss" id="bsa-dismiss-btn">Dismiss</button>
-    </div>
-  </div>
-
-</div>`;
-}
-
-// ── Widget state machine ───────────────────────────────────────────────────────
-let _widgetState  = 'cta';    // 'cta' | 'monitoring' | 'found' | 'hidden'
-let _monitorId    = null;
-let _pollInterval = null;
-let _selectedPref = 'best';
-let _show         = null;
-
-function _setWidgetState(state) {
-  _widgetState = state;
-  const cta = document.getElementById('bsa-cta');
-  const mon = document.getElementById('bsa-monitoring');
-  const fnd = document.getElementById('bsa-found');
-  if (!cta) return;
-  cta.classList.toggle('bsa-active', state === 'cta');
-  mon.classList.toggle('bsa-active', state === 'monitoring');
-  fnd.classList.toggle('bsa-active', state === 'found');
-}
-
-function _attachWidgetListeners(show) {
-  // Back rows checkbox
-  const backOnlyCheckbox = document.getElementById('bsa-back-only');
-  if (backOnlyCheckbox) {
-    backOnlyCheckbox.addEventListener('change', () => {
-      _selectedPref = backOnlyCheckbox.checked ? 'back' : 'best';
+  // ── 3. DOM fallbacks ───────────────────────────────────────────────────────
+  if (!info.movie) {
+    info.movie = safeExtract(() => {
+      const h1 = document.querySelector('h1');
+      return h1 ? h1.textContent.trim().substring(0, 80) : '';
     });
   }
+  if (!info.venue || !info.showtime) {
+    safeExtract(() => {
+      const spans = Array.from(document.querySelectorAll('span'));
+      const infoSpan = spans.find(
+        el => /\|/.test(el.textContent) && /\d{1,2}:\d{2}/.test(el.textContent)
+      );
+      if (!infoSpan) return;
+      const parts = infoSpan.textContent.split('|').map(s => s.trim());
+      if (!info.venue && parts[0])    info.venue = parts[0];
+      const timePart = parts.find(p => /\d{1,2}:\d{2}\s*[AP]M/i.test(p));
+      if (timePart && !info.showtime) {
+        const m = timePart.match(/(\d{1,2}:\d{2}\s*[AP]M)/i);
+        if (m) info.showtime = m[0].toUpperCase();
+      }
+    });
+  }
+  if (!info.movie && document.title && !document.title.includes('BookMyShow')) {
+    const tp = document.title.split('|').map(s => s.trim()).filter(Boolean);
+    if (tp[0]) info.movie = tp[0];
+  }
 
-  // Customize toggle
-  document.getElementById('bsa-cust-toggle').addEventListener('click', () => {
-    const panel = document.getElementById('bsa-cust-panel');
-    const isOpen = panel.classList.toggle('bsa-open');
-    document.getElementById('bsa-cust-toggle').textContent = isOpen ? '⚙ Customize ▴' : '⚙ Customize ▾';
-  });
+  // ── 4. Append readable date label ─────────────────────────────────────────
+  if (info.date && info.date.length === 8 && info.showtime) {
+    info.showtime = safeExtract(() => {
+      const y = info.date.slice(0, 4);
+      const m = info.date.slice(4, 6);
+      const d = info.date.slice(6, 8);
+      const label = new Date(`${y}-${m}-${d}`)
+        .toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+      return `${info.showtime}, ${label}`;
+    }) || info.showtime;
+  }
 
-  // Minimise
-  document.getElementById('bsa-minimise-btn').addEventListener('click', () => {
-    const widget = document.getElementById(WIDGET_ID);
-    if (widget) widget.style.display = 'none';
-  });
+  return info;
+}
 
-  // Watch this show
-  document.getElementById('bsa-watch-btn').addEventListener('click', async () => {
-    // Read phone from customize panel (or from chrome.storage)
-    const phoneInput = document.getElementById('bsa-phone');
-    let phone = phoneInput?.value?.replace(/\s/g, '') || '';
+// ══════════════════════════════════════════════════════════════════════════════
+//  LISTING PAGE  (/movies/{city}/{slug}/buytickets/{eventCode}/{date})
+//
+//  The page renders a theatre card per cinema, each containing:
+//    - An <a href="/cinemas/{city}/{slug}/buytickets/{venueCode}/{date}"> link
+//    - Time <div>s with showtime text ("10:15 PM")
+//
+//  Strategy: per-theatre container scoping.
+//  For each cinema link we walk UP the ancestor chain until we find the smallest
+//  element that contains ONLY that one cinema link (not any sibling links).
+//  All showtime leaf-nodes are then collected from WITHIN that container alone,
+//  so we never accidentally grab showtimes from an adjacent theatre card.
+//  Results are deduplicated by venueCode and showtimes are merged.
+// ══════════════════════════════════════════════════════════════════════════════
 
-    // Try stored phone first
-    if (!phone) {
-      phone = await _getStoredPhone();
+function parseListingInfo() {
+  const info = {
+    movie:     '',
+    eventCode: '',
+    date:      '',
+    theatres:  [],  // [{name, venueCode, date, cinemaUrl, showtimes:[string]}]
+  };
+
+  // ── eventCode + date from URL ─────────────────────────────────────────────
+  const urlMatch = window.location.pathname.match(
+    /\/movies\/[^/]+\/[^/]+\/buytickets\/(ET[^/]+)\/(\d{8})/i
+  );
+  if (urlMatch) {
+    info.eventCode = urlMatch[1];
+    info.date      = urlMatch[2];
+  }
+  if (!info.eventCode) {
+    const m = window.location.pathname.match(/(ET\d+)/i);
+    if (m) info.eventCode = m[1];
+  }
+
+  // ── Movie name — "Youth Movie Showtimes in Chennai…" → "Youth" ────────────
+  info.movie = safeExtract(() => {
+    const h1 = document.querySelector('h1');
+    if (h1) return h1.textContent.trim().replace(/\s*[-–(].*$/, '').trim().substring(0, 80);
+    return '';
+  }) || '';
+  if (!info.movie) {
+    const m = document.title.match(/^(.+?)\s+(?:Movie\s+Showtimes|-|–|\|)/i);
+    if (m) info.movie = m[1].trim().substring(0, 80);
+    else {
+      const tp = document.title.split(/[-|]/).map(s => s.trim())
+        .filter(s => s && !s.includes('BookMyShow'));
+      if (tp[0]) info.movie = tp[0].substring(0, 80);
     }
+  }
 
-    if (!phone || phone.length < 10) {
-      // Open customize to enter phone
-      const panel = document.getElementById('bsa-cust-panel');
-      panel.classList.add('bsa-open');
-      document.getElementById('bsa-cust-toggle').textContent = '⚙ Customize ▴';
-      phoneInput?.focus();
+  // ── Find all cinema links ─────────────────────────────────────────────────
+  // href pattern: /cinemas/{city}/{cinema-slug}/buytickets/{venueCode}/{date}
+  const cinemaLinks = Array.from(document.querySelectorAll(
+    'a[href*="/cinemas/"][href*="/buytickets/"]'
+  ));
+  console.log(`[BMS] parseListingInfo: found ${cinemaLinks.length} cinema link(s)`);
+  if (cinemaLinks.length === 0) return info;
+
+  const timePattern = /^\s*\d{1,2}:\d{2}\s*(AM|PM)\s*$/i;
+
+  // venueCode → theatre record  (for dedup + showtime merge)
+  const venueMap = new Map();
+
+  cinemaLinks.forEach((link, idx) => {
+    const href = link.getAttribute('href') || '';
+    const m = href.match(/\/cinemas\/([^/]+)\/([^/]+)\/buytickets\/([^/?#]+)\/(\d{8})/);
+    if (!m) {
+      console.log(`[BMS]   link[${idx}] no venueCode match in href="${href}", skipping`);
       return;
     }
 
-    await _startSniperMonitor(show, phone);
-  });
+    const [, , cinemaSlug, venueCode, date] = m;
+    const cinemaUrl = href.startsWith('http')
+      ? href
+      : `https://in.bookmyshow.com${href}`;
 
-  // Stop
-  document.getElementById('bsa-stop-btn').addEventListener('click', async () => {
-    clearInterval(_pollInterval);
-    if (_monitorId) {
-      try { await fetch(`${SERVER_URL}/api/monitor/${_monitorId}/stop`, { method: 'POST' }); } catch (_) {}
+    // ── Per-theatre container detection ──────────────────────────────────────
+    // Walk UP ancestors until we reach an element that wraps EXACTLY this one
+    // cinema link (not any other cinema link).  That's the theatre card.
+    let container = link.parentElement;
+    for (let depth = 0; depth < 15 && container && container !== document.body; depth++) {
+      const linksInside = container.querySelectorAll(
+        'a[href*="/cinemas/"][href*="/buytickets/"]'
+      );
+      if (linksInside.length === 1) break;   // found the single-theatre wrapper
+      container = container.parentElement;
     }
-    _monitorId = null;
-    chrome.storage.local.set({ sniperJob: null });
-    _setWidgetState('cta');
-  });
+    // Safety: if we walked all the way up without isolating, fall back to link's parent
+    if (!container || container === document.body) container = link.parentElement;
 
-  // Book now
-  document.getElementById('bsa-book-btn').addEventListener('click', () => {
-    // The current URL is the seat layout — user is already here
-    window.location.reload();
-  });
+    const containerDesc = container
+      ? `${container.tagName}.${String(container.className).replace(/\s+/g, '.').slice(0, 50)}`
+      : 'null';
+    console.log(`[BMS]   link[${idx}] venueCode=${venueCode} container=${containerDesc}`);
 
-  // Dismiss
-  document.getElementById('bsa-dismiss-btn').addEventListener('click', () => {
-    chrome.storage.local.set({ sniperJob: null });
-    const widget = document.getElementById(WIDGET_ID);
-    if (widget) widget.style.display = 'none';
-  });
-}
+    // ── Theatre name — scoped to this container ───────────────────────────
+    let name = '';
 
-// ── Start sniper monitor ───────────────────────────────────────────────────────
-async function _startSniperMonitor(show, phone) {
-  _setWidgetState('monitoring');
-  const prefText = _selectedPref === 'back'
-    ? 'Back rows only · will skip front & middle'
-    : 'Best available · any open seat';
-  document.getElementById('bsa-pref-text').textContent = prefText;
+    // 1. Anchor text (BMS sometimes wraps the cinema name inside the <a>)
+    const linkText = (link.textContent || '').trim().replace(/\s+/g, ' ');
+    if (linkText.length >= 4 && linkText.length <= 120 && !/^\d{1,2}:\d{2}/.test(linkText)) {
+      name = linkText.substring(0, 80);
+    }
 
-  const payload = {
-    movie:       show.movieName,
-    theatre:     show.venueName,
-    showtime:    show.showtime,
-    show_id:     show.showId,
-    event_code:  show.eventCode,
-    venue_code:  show.venueCode,
-    date:        show.date,
-    booking_url: window.location.href,
-    zone_pref:   _selectedPref,
-    phone:       '+91' + phone.replace(/\D/g, '').slice(-10),
-    poll_interval: 15,
-    mode:        'sniper',
-  };
-
-  // Save phone for future use
-  chrome.storage.local.set({ sniperPhone: phone });
-
-  try {
-    const resp = await fetch(`${SERVER_URL}/api/monitor`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await resp.json();
-    _monitorId = data.monitor_id;
-
-    chrome.storage.local.set({
-      sniperJob: { monitorId: _monitorId, show, pref: _selectedPref }
-    });
-
-    // Start polling server for status
-    _startStatusPoll();
-
-  } catch (err) {
-    _setWidgetState('cta');
-    document.getElementById('bsa-status-text').textContent = 'Could not reach server';
-  }
-}
-
-function _startStatusPoll() {
-  clearInterval(_pollInterval);
-  let pollCount = 0;
-  _pollInterval = setInterval(async () => {
-    if (!_monitorId) return;
-    try {
-      const resp = await fetch(`${SERVER_URL}/api/monitor/${_monitorId}`);
-      const data = await resp.json();
-      pollCount++;
-
-      const statusEl = document.getElementById('bsa-status-text');
-      if (statusEl) statusEl.textContent = `Checking… (${pollCount} scans)`;
-
-      if (data.status === 'seats_found' || data.alert_sent) {
-        clearInterval(_pollInterval);
-        // Update found card
-        const foundWhere = document.getElementById('bsa-found-where');
-        if (foundWhere) {
-          foundWhere.textContent = `${_show?.movieName || 'Show'} · ${_show?.showtime || ''} · ${_show?.venueName || ''}`;
+    // 2. Heading / semantic-class element inside the container
+    if (!name) {
+      name = safeExtract(() => {
+        const selectors = [
+          'h2', 'h3', 'h4',
+          '[class*="venue"]', '[class*="theatre"]', '[class*="cinema"]', '[class*="name"]',
+        ];
+        for (const sel of selectors) {
+          for (const c of container.querySelectorAll(sel)) {
+            if (c === link || c.contains(link)) continue;   // skip the anchor itself
+            const t = c.textContent.trim().replace(/\s+/g, ' ');
+            if (t.length >= 4 && t.length <= 120 && !/^\d{1,2}:\d{2}/.test(t)) {
+              return t.substring(0, 80);
+            }
+          }
         }
-        _setWidgetState('found');
-        chrome.storage.local.set({ sniperJob: null });
-      }
-    } catch (_) {}
-  }, 8000);
-}
-
-// ── Inject widget ──────────────────────────────────────────────────────────────
-function injectWidget(show) {
-  // Remove existing widget if any
-  const existing = document.getElementById(WIDGET_ID);
-  if (existing) existing.remove();
-
-  const div = document.createElement('div');
-  div.innerHTML = buildWidgetHTML(show);
-  document.body.appendChild(div.firstElementChild);
-  _attachWidgetListeners(show);
-}
-
-// ── URL change detection (BMS uses client-side routing) ───────────────────────
-let _lastUrl = window.location.href;
-
-function _onUrlChange() {
-  const current = window.location.href;
-  if (current === _lastUrl) return;
-  _lastUrl = current;
-
-  // Slight delay to let DOM settle after navigation
-  setTimeout(() => {
-    const show = parseShowInfo();
-    if (show) {
-      _show = show;
-      const existing = document.getElementById(WIDGET_ID);
-      if (existing) {
-        // Update show info in place without rebuilding (preserves monitoring state)
-        const nameEls = existing.querySelectorAll('.bsa-show-name');
-        nameEls.forEach(el => { el.textContent = show.movieName || 'This show'; });
-        const detailEls = existing.querySelectorAll('.bsa-show-detail');
-        detailEls.forEach(el => {
-          el.textContent = (show.venueName ? show.venueName + ' · ' : '') + (show.showtime || '');
-        });
-      } else {
-        injectWidget(show);
-      }
-    } else {
-      // Left the seat layout page — hide widget
-      const w = document.getElementById(WIDGET_ID);
-      if (w) w.style.display = 'none';
+        return '';
+      }) || '';
     }
-  }, 800);
-}
 
-// Watch for pushState / replaceState navigation
-const _origPush    = history.pushState.bind(history);
-const _origReplace = history.replaceState.bind(history);
-history.pushState    = (...a) => { _origPush(...a);    _onUrlChange(); };
-history.replaceState = (...a) => { _origReplace(...a); _onUrlChange(); };
-window.addEventListener('popstate', _onUrlChange);
+    // 3. Walk up from link looking for a heading sibling (stays inside container)
+    if (!name) {
+      name = safeExtract(() => {
+        let el = link.parentElement;
+        while (el && el !== container && el !== document.body) {
+          for (const sel of ['h2', 'h3', 'h4']) {
+            const h = el.querySelector(sel);
+            if (h) {
+              const t = h.textContent.trim().replace(/\s+/g, ' ');
+              if (t.length >= 4 && t.length <= 120 && !/^\d{1,2}:\d{2}/.test(t)) {
+                return t.substring(0, 80);
+              }
+            }
+          }
+          el = el.parentElement;
+        }
+        return '';
+      }) || '';
+    }
 
-// MutationObserver as fallback for any DOM-driven URL changes
-const _urlObserver = new MutationObserver(_onUrlChange);
-_urlObserver.observe(document.body, { childList: true, subtree: true });
+    // 4. Prettify the URL slug as last resort
+    if (!name) {
+      name = cinemaSlug
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .substring(0, 80);
+    }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function _prefLabel(p) {
-  return { best: 'Best available', back: 'Back rows', mid: 'Middle', nfront: 'Avoid front' }[p] || p;
-}
+    // ── Showtimes — only from within this theatre's container ───────────────
+    const showtimes = Array.from(container.querySelectorAll('*'))
+      .filter(el => el.children.length === 0 && timePattern.test(el.textContent))
+      .map(el => el.textContent.trim())
+      .filter(Boolean);
 
-async function _getStoredPhone() {
-  return new Promise(resolve => {
-    chrome.storage.local.get('sniperPhone', d => resolve(d.sniperPhone || ''));
+    console.log(`[BMS]   link[${idx}] name="${name}" showtimes=${JSON.stringify(showtimes)}`);
+
+    // ── Dedup by venueCode — merge showtimes if same venue appears twice ─────
+    if (venueMap.has(venueCode)) {
+      const existing = venueMap.get(venueCode);
+      const merged = Array.from(new Set([...existing.showtimes, ...showtimes]));
+      existing.showtimes = merged;
+      console.log(`[BMS]   link[${idx}] venueCode=${venueCode} already seen — merged to ${merged.length} showtime(s)`);
+    } else {
+      venueMap.set(venueCode, { name, venueCode, date: date || info.date, cinemaUrl, showtimes });
+    }
   });
+
+  info.theatres = Array.from(venueMap.values());
+  console.log(`[BMS] parseListingInfo done: ${info.theatres.length} unique theatre(s)`);
+  return info;
 }
 
-// ── Message handler (popup still calls GET_PAGE_INFO) ─────────────────────────
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'GET_PAGE_INFO') {
-    const show = parseShowInfo();
-    sendResponse({
-      showName: show?.movieName || document.title.replace(/[-|].*/, '').trim(),
-      url: window.location.href,
-      showInfo: show,
-    });
+// ── Utility ───────────────────────────────────────────────────────────────────
+function safeExtract(fn) {
+  try { return fn() || ''; } catch { return ''; }
+}
+
+// ── Message listener ──────────────────────────────────────────────────────────
+chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req.action === 'getShowInfo') {
+    const pageType = detectPageType();
+
+    if (pageType === 'listing') {
+      // Retry up to 2 times if the first parse finds no showtimes —
+      // BMS React pages sometimes finish hydrating a moment after DOMContentLoaded.
+      const MAX_ATTEMPTS = 2;
+      const RETRY_DELAY_MS = 500 + Math.floor(Math.random() * 300); // 500-800 ms
+
+      const tryParse = (attempt) => {
+        const info = parseListingInfo();
+        const usable = info.theatres.some(t => t.showtimes.length > 0);
+        console.log(
+          `[BMS] listing parse attempt ${attempt}/${MAX_ATTEMPTS}: ` +
+          `${info.theatres.length} theatre(s), usable=${usable}`
+        );
+
+        if (!usable && attempt < MAX_ATTEMPTS) {
+          console.log(`[BMS] retrying parseListingInfo in ${RETRY_DELAY_MS}ms…`);
+          setTimeout(() => tryParse(attempt + 1), RETRY_DELAY_MS);
+        } else {
+          sendResponse({ listing: usable ? info : null });
+        }
+      };
+
+      tryParse(1);
+
+    } else {
+      const show = parseShowInfo();
+      const hasState = !!window.__INITIAL_STATE__?.seatlayoutMovies?.seatLayoutData;
+      const onShowPage = show.showId || show.movie || show.eventCode || hasState;
+      sendResponse({ show: onShowPage ? show : null });
+    }
   }
-  return true;
+  return true; // keep channel open for async sendResponse
 });
-
-// ── Boot ───────────────────────────────────────────────────────────────────────
-(function boot() {
-  const show = parseShowInfo();
-  if (!show) return; // Not on a seat-layout page
-
-  _show = show;
-
-  // Check if there's an active sniper job for this show
-  chrome.storage.local.get('sniperJob', data => {
-    if (data.sniperJob?.show?.showId === show.showId) {
-      // Resume monitoring state
-      _monitorId = data.sniperJob.monitorId;
-      _selectedPref = data.sniperJob.pref || 'best';
-      injectWidget(show);
-      _setWidgetState('monitoring');
-      _startStatusPoll();
-    } else {
-      // Fresh — show CTA only if page appears sold out
-      injectWidget(show);
-      const { soldOut } = detectSoldOut();
-      if (!soldOut) {
-        // Seats are available — hide widget (nothing to do)
-        const w = document.getElementById(WIDGET_ID);
-        if (w) w.style.display = 'none';
-      }
-      // If sold out → widget stays visible with CTA
-    }
-  });
-})();
