@@ -45,6 +45,29 @@ BMS_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# Optional: paste your real BMS browser cookies into this Railway env var
+# to bypass Cloudflare bot detection on seat-layout pages.
+# Format: the raw "cookie: ..." header value copied from Chrome DevTools.
+BMS_COOKIES_RAW = os.environ.get("BMS_COOKIES", "")
+
+def _parse_cookie_string(raw):
+    """Convert a raw cookie header string into a list of Playwright cookie dicts."""
+    if not raw:
+        return []
+    cookies = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        cookies.append({
+            "name":   name.strip(),
+            "value":  value.strip(),
+            "domain": ".bookmyshow.com",
+            "path":   "/",
+        })
+    return cookies
 MAX_ACTIVE_PER_PHONE = 5
 MAX_RUNTIME_SECS = 1800
 MAX_FAILURES = 10
@@ -345,6 +368,15 @@ def _run_monitor(monitor_id):
                 timezone_id="Asia/Kolkata",
             )
             page = context.new_page()
+
+            # Inject real browser cookies if provided — bypasses Cloudflare
+            bms_cookies = _parse_cookie_string(BMS_COOKIES_RAW)
+            if bms_cookies:
+                context.add_cookies(bms_cookies)
+                log.info("[cookies] Injected %d BMS cookies into browser context", len(bms_cookies))
+            else:
+                log.info("[cookies] No BMS_COOKIES env var set — running without session cookies")
+
             payload_cache = {"snapshot": None, "source": "", "updated_at": None}
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -391,6 +423,34 @@ def _run_monitor(monitor_id):
                         page.reload(timeout=45_000, wait_until=wait_event)
 
                     page.wait_for_timeout(2000)
+
+                    # ── Cloudflare detection ──────────────────────────────────
+                    cf_detected = page.evaluate("""
+                        () => {
+                            const url = window.location.href || '';
+                            const title = document.title || '';
+                            const body = document.body?.innerText || '';
+                            return (
+                                url.includes('challenges.cloudflare.com') ||
+                                title.toLowerCase().includes('just a moment') ||
+                                title.toLowerCase().includes('attention required') ||
+                                body.includes('cf-turnstile') ||
+                                !!document.querySelector('#challenge-form, .cf-error-details, [data-ray]')
+                            );
+                        }
+                    """)
+                    if cf_detected:
+                        monitor = _load_monitor(monitor_id)
+                        monitor["status"] = "blocked_by_cloudflare"
+                        _save_monitor(monitor_id, monitor)
+                        _add_log(
+                            monitor_id,
+                            "🛡️ Cloudflare challenge detected — BMS is blocking the server. "
+                            "Add BMS_COOKIES env var to bypass.",
+                            "error",
+                        )
+                        log.warning("[%s] Cloudflare challenge detected on %s", monitor_id, nav_url if first_load else "reload")
+                        break
 
                     # For session mode wait until __INITIAL_STATE__ is hydrated
                     # (BMS populates it via client-side JS after domcontentloaded)
