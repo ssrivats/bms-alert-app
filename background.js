@@ -363,7 +363,55 @@ async function pollListingMonitor(monitor) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Request the latest captured seat-layout payload from a browser tab.
+// Looks for an open BMS seat-layout tab whose URL matches the monitor's
+// booking URL, then asks its content script for the payload it intercepted.
+// Returns { ok, payload, updatedAt } or { ok: false, reason }.
+// ────────────────────────────────────────────────────────────────────────────
+async function getLiveSeatPayloadFromTab(bookingUrl) {
+  try {
+    const tabs = await chrome.tabs.query({
+      url: 'https://in.bookmyshow.com/movies/*/seat-layout/*'
+    });
+
+    if (tabs.length === 0) {
+      return { ok: false, reason: 'no_seat_layout_tab_open' };
+    }
+
+    // Prefer the tab whose URL shares the most path segments with bookingUrl
+    let targetTab = tabs[0];
+    try {
+      const pathSegments = new URL(bookingUrl).pathname.split('/').filter(Boolean);
+      let bestScore = 0;
+      for (const tab of tabs) {
+        const score = pathSegments.filter(seg => tab.url && tab.url.includes(seg)).length;
+        if (score > bestScore) { bestScore = score; targetTab = tab; }
+      }
+    } catch {}
+
+    console.log(`[getLiveSeatPayloadFromTab] Querying tab ${targetTab.id}: ${targetTab.url}`);
+
+    return new Promise((resolve) => {
+      chrome.tabs.sendMessage(targetTab.id, { action: 'getLiveSeatPayload' }, (resp) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, reason: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(resp || { ok: false, reason: 'empty_response' });
+      });
+    });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Poll session mode: fetch seat layout, check for available seats in preferred rows
+//
+// HTML state failures are SOFT — we fall through to the live-payload path
+// rather than returning early.  The live payload (captured by the page-context
+// interceptor in the user's open seat-layout tab) contains the renderGroups
+// data that __INITIAL_STATE__ often lacks.
 // ────────────────────────────────────────────────────────────────────────────
 async function pollSessionMonitor(monitor) {
   try {
@@ -377,59 +425,42 @@ async function pollSessionMonitor(monitor) {
       return;
     }
 
+    // ── Step 1: Extract HTML state (soft — failures fall through) ────────────
+    // Used for category pre-check.  Missing state does NOT cause early return;
+    // the live-payload path below can still confirm row availability.
+    let htmlCategories = null;   // Categories[] from the matching ShowTime
+    let htmlStateData  = null;   // seatlayoutMovies.seatLayoutData
+
     const state = extractInitialState(html);
-    if (!state) {
-      console.warn(`[pollSessionMonitor] Could not extract state for ${monitor.id}`);
-      await notifyBackend(monitor.id, {
-        status: 'checking_rows',
-        message: '⏳ Seat layout loaded but state parsing failed. Retrying...'
-      });
-      return;
-    }
-
-    // Navigate: state.seatlayoutMovies.seatLayoutData.currentVenue.ShowTimes
-    if (!state.seatlayoutMovies || !state.seatlayoutMovies.seatLayoutData) {
-      console.warn(`[pollSessionMonitor] No seatlayoutMovies.seatLayoutData in state`);
-      await notifyBackend(monitor.id, {
-        status: 'checking_rows',
-        message: '⏳ Checking availability...'
-      });
-      return;
-    }
-
-    const currentVenue = state.seatlayoutMovies.seatLayoutData.currentVenue;
-    if (!currentVenue || !currentVenue.ShowTimes) {
-      console.warn(`[pollSessionMonitor] No currentVenue.ShowTimes in state`);
-      await notifyBackend(monitor.id, {
-        status: 'checking_rows',
-        message: '⏳ Checking availability...'
-      });
-      return;
-    }
-
-    // Find the show matching our sessionId
-    let targetShow = null;
-    for (const show of currentVenue.ShowTimes) {
-      if (show.sessionid === monitor.sessionId || show.SessionId === monitor.sessionId) {
-        targetShow = show;
-        break;
+    if (state?.seatlayoutMovies?.seatLayoutData) {
+      htmlStateData = state.seatlayoutMovies.seatLayoutData;
+      const venue = htmlStateData.currentVenue;
+      if (venue?.ShowTimes) {
+        const wantedId = String(monitor.sessionId || '');
+        const targetShow = venue.ShowTimes.find(
+          s => String(s.sessionid) === wantedId || String(s.SessionId) === wantedId
+        );
+        if (targetShow) htmlCategories = targetShow.Categories || [];
       }
     }
 
-    if (!targetShow) {
-      console.warn(`[pollSessionMonitor] Show with sessionId ${monitor.sessionId} not found`);
-      await notifyBackend(monitor.id, {
-        status: 'checking_rows',
-        message: '⏳ Checking availability...'
-      });
-      return;
+    if (htmlCategories) {
+      console.log(`[pollSessionMonitor] HTML state OK for ${monitor.id}: ${htmlCategories.length} categorie(s)`);
+    } else {
+      console.warn(`[pollSessionMonitor] HTML state incomplete for ${monitor.id} — will rely on live payload`);
     }
 
-    const categories = targetShow.Categories || [];
-
+    // ── Step 2: No row-preference path ───────────────────────────────────────
     if (!monitor.preferredRows || monitor.preferredRows.length === 0) {
-      // No row preference: alert if any category is available
-      const hasAvailable = categories.some(cat => cat.AvailStatus === '1');
+      if (!htmlCategories) {
+        // Can't confirm without category data; wait for next poll
+        await notifyBackend(monitor.id, {
+          status:  'checking_rows',
+          message: '⏳ Checking availability…'
+        });
+        return;
+      }
+      const hasAvailable = htmlCategories.some(cat => cat.AvailStatus === '1');
       if (hasAvailable) {
         console.log(`[pollSessionMonitor] Any-seat availability confirmed for ${monitor.id}`);
         const alertResult = await triggerAlert(monitor.id);
@@ -440,11 +471,14 @@ async function pollSessionMonitor(monitor) {
           message: '⏳ All sections still sold out. Checking again next poll…'
         });
       }
-    } else {
-      // Row preference set — must confirm at seat level before alerting.
-      // Fast exit: if no category is open, preferred rows can't be open either.
-      const anyCategoryOpen = categories.some(cat => cat.AvailStatus === '1');
+      return;
+    }
 
+    // ── Step 3: Row-preference path — category fast-exit ────────────────────
+    // Only bail if we HAVE category data AND every category is closed.
+    // If category data is absent (HTML incomplete), skip this check and proceed.
+    if (htmlCategories) {
+      const anyCategoryOpen = htmlCategories.some(cat => cat.AvailStatus === '1');
       if (!anyCategoryOpen) {
         await notifyBackend(monitor.id, {
           status:  'checking_rows',
@@ -452,37 +486,57 @@ async function pollSessionMonitor(monitor) {
         });
         return;
       }
+      console.log(`[pollSessionMonitor] Category open for ${monitor.id} — proceeding to row check`);
+    } else {
+      console.warn(`[pollSessionMonitor] No category data for ${monitor.id} — attempting row check via live payload`);
+    }
 
-      // At least one category open — check actual seat rows in renderGroups.
-      const rowCheck = checkRowsInSeatLayout(
-        state.seatlayoutMovies.seatLayoutData,
-        monitor.preferredRows
+    // ── Step 4: Row check — live payload preferred, HTML state as fallback ───
+    const liveResult = await getLiveSeatPayloadFromTab(monitor.bookingUrl);
+    let seatDataForRowCheck = null;
+
+    if (liveResult.ok && liveResult.payload) {
+      const ageMs = Date.now() - (liveResult.updatedAt || 0);
+      console.log(`[pollSessionMonitor] Using live payload for ${monitor.id} (age: ${Math.round(ageMs / 1000)}s)`);
+      seatDataForRowCheck = liveResult.payload;
+    } else if (htmlStateData) {
+      console.log(`[pollSessionMonitor] No live payload (${liveResult.reason}) — using HTML state for ${monitor.id}`);
+      seatDataForRowCheck = htmlStateData;
+    } else {
+      // Neither source has data
+      const hint = liveResult.reason === 'no_seat_layout_tab_open'
+        ? `⏳ Watching rows ${monitor.preferredRows.join(', ')}… Keep the seat map page open for row-level detection.`
+        : `⏳ Watching rows ${monitor.preferredRows.join(', ')} — no seat data yet (${liveResult.reason})`;
+      console.warn(`[pollSessionMonitor] No seat data for ${monitor.id}: ${liveResult.reason}`);
+      await notifyBackend(monitor.id, { status: 'checking_rows', message: hint });
+      return;
+    }
+
+    const rowCheck = checkRowsInSeatLayout(seatDataForRowCheck, monitor.preferredRows);
+
+    if (!rowCheck.hasData) {
+      const why  = liveResult.ok ? 'live payload has no renderGroups' : liveResult.reason;
+      const hint = liveResult.reason === 'no_seat_layout_tab_open'
+        ? `⏳ Sections open — keep the seat map page open for row-level detection.`
+        : `⏳ Sections open — waiting for seat data (${why})…`;
+      console.warn(`[pollSessionMonitor] renderGroups absent for ${monitor.id}: ${why}`);
+      await notifyBackend(monitor.id, { status: 'checking_rows', message: hint });
+      return;
+    }
+
+    if (rowCheck.available) {
+      console.log(`[pollSessionMonitor] Row ${rowCheck.matchedRow} confirmed available for ${monitor.id}`);
+      const alertResult = await triggerAlert(monitor.id);
+      await handleAlertResult(
+        monitor.id,
+        alertResult,
+        `Row ${rowCheck.matchedRow} is open for your session.`
       );
-
-      if (!rowCheck.hasData) {
-        // renderGroups not present in state — cannot confirm rows. Do NOT alert.
-        console.warn(`[pollSessionMonitor] Categories open but renderGroups absent for ${monitor.id}. Holding alert until seat data available.`);
-        await notifyBackend(monitor.id, {
-          status:  'checking_rows',
-          message: `⏳ Sections open but seat-level data not yet loaded — still watching rows ${monitor.preferredRows.join(', ')}…`
-        });
-        return;
-      }
-
-      if (rowCheck.available) {
-        console.log(`[pollSessionMonitor] Row ${rowCheck.matchedRow} confirmed available for ${monitor.id}`);
-        const alertResult = await triggerAlert(monitor.id);
-        await handleAlertResult(
-          monitor.id,
-          alertResult,
-          `Row ${rowCheck.matchedRow} is open for your session.`
-        );
-      } else {
-        await notifyBackend(monitor.id, {
-          status:  'checking_rows',
-          message: `⏳ Sections open but rows ${monitor.preferredRows.join(', ')} not yet available. Watching…`
-        });
-      }
+    } else {
+      await notifyBackend(monitor.id, {
+        status:  'checking_rows',
+        message: `⏳ Sections open but rows ${monitor.preferredRows.join(', ')} not yet available. Watching…`
+      });
     }
   } catch (err) {
     console.error(`[pollSessionMonitor] Error for ${monitor.id}:`, err);
